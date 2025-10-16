@@ -174,17 +174,6 @@ def is_in_scope(text: str) -> bool:
         # В сомнительных случаях — не блокируем
         return True
 
-# === Проверка вебхука ===
-@app.route("/webhook", methods=["GET"])
-def verify():
-    mode = request.args.get("hub.mode")
-    token = request.args.get("hub.verify_token")
-    challenge = request.args.get("hub.challenge")
-    if mode == "subscribe" and token == VERIFY_TOKEN:
-        print("✅ Webhook verified!")
-        return challenge, 200
-    return "Verification failed", 403
-
 # === Обработка сообщений ===
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -224,8 +213,9 @@ def webhook():
         else:
             user_message = "Мен әзірге бұл форматтағы хабарламаларды қабылдай алмаймын 🙂"
 
+        # Автоязык по последнему сообщению/истории
         preferred_lang = get_preferred_lang(phone_number, user_message)
-        
+
         # Off-topic фильтр
         if not is_in_scope(user_message):
             send_whatsapp_message(phone_number, offtop_reply_for(user_message))
@@ -243,46 +233,44 @@ def webhook():
             {"role": "system", "content": lang_system_instruction(preferred_lang)},
         ] + sessions[phone_number]
 
-        # Вызываем модель с фолбэком и анти-повтором
-reply = ""
-try:
-    ai_response = client.chat.completions.create(
-        model="gpt-5",
-        messages=messages,
-        max_completion_tokens=450
-    )
-    reply = (ai_response.choices[0].message.content or "").strip()
-except Exception as e:
-    print("❌ AI response error:", e)
-    reply = ""
+        # --- Генерация с фолбэком и анти-повтором ---
+        reply = ""
+        try:
+            ai_response = client.chat.completions.create(
+                model="gpt-5",
+                messages=messages,
+                max_completion_tokens=450
+            )
+            reply = (ai_response.choices[0].message.content or "").strip()
+        except Exception as e:
+            print("❌ AI response error:", e)
+            reply = ""
 
-# Если модель вернула пусто/очень коротко — одна попытка доформулировать без повтора
-if len(_normalize(reply)) < 8 or is_repeat(phone_number, reply):
-    lang = preferred_lang  # уже определён выше через get_preferred_lang(...)
-    regen_messages = messages + [
-        {"role": "system", "content": fallback_prompt(lang)}
-    ]
-    try:
-        ai_response2 = client.chat.completions.create(
-            model="gpt-5",
-            messages=regen_messages,
-            max_completion_tokens=300
-        )
-        alt = (ai_response2.choices[0].message.content or "").strip()
-        if alt and not is_repeat(phone_number, alt):
-            reply = alt
-    except Exception as e:
-        print("❌ AI regen error:", e)
+        # Если пусто/очень коротко или повтор — одна попытка перегенерации с подсказкой
+        if len(_normalize(reply)) < 8 or is_repeat(phone_number, reply):
+            regen_messages = messages + [
+                {"role": "system", "content": fallback_prompt(preferred_lang)}
+            ]
+            try:
+                ai_response2 = client.chat.completions.create(
+                    model="gpt-5",
+                    messages=regen_messages,
+                    max_completion_tokens=300
+                )
+                alt = (ai_response2.choices[0].message.content or "").strip()
+                if alt and not is_repeat(phone_number, alt):
+                    reply = alt
+            except Exception as e:
+                print("❌ AI regen error:", e)
 
-# Если всё ещё пусто/повтор — поставим разнообразный фолбэк
-if len(_normalize(reply)) < 8 or is_repeat(phone_number, reply):
-    reply = fallback_text(preferred_lang)
+        # Если всё ещё пусто/повтор — финальный фолбэк
+        if len(_normalize(reply)) < 8 or is_repeat(phone_number, reply):
+            reply = fallback_text(preferred_lang)
 
-# Перед отправкой — не допускаем дословного повтора подряд
-if is_repeat(phone_number, reply):
-    reply = reply + " 🙂"
+        # Перед отправкой — не допускаем дословного повтора подряд
+        if is_repeat(phone_number, reply):
+            reply = reply + " 🙂"
 
-    
         # Триггеры эскалации — с антиспамом 15 минут
         hot_flags = ["созвон", "звонок", "call", "сегодня", "asap", "бюджет", "смета", "цена", "стоимость"]
         if any(flag.lower() in (user_message.lower() + " " + reply.lower()) for flag in hot_flags):
@@ -296,7 +284,6 @@ if is_repeat(phone_number, reply):
         print("❌ Ошибка:", e)
 
     return "ok", 200
-
 
 # ====== Антиспам эскалации ======
 def should_notify_owner(phone: str) -> bool:
@@ -474,6 +461,7 @@ def fallback_text(lang: str) -> str:
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
