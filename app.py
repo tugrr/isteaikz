@@ -278,7 +278,7 @@ def send_whatsapp_message(to, message):
     if not body:
         body = "…"  # минимальный валидный символ, можно заменить на ваш дефолт
 
-    url = f"https://graph.facebook.com/v24.0/{WHATSAPP_PHONE_ID}/messages"
+    url = f"https://graph.facebook.com/v21.0/{WHATSAPP_PHONE_ID}/messages"
     headers = {
         "Authorization": f"Bearer {WHATSAPP_TOKEN}",
         "Content-Type": "application/json; charset=UTF-8",
@@ -355,7 +355,7 @@ def describe_image(media_id):
 
 # === Получение ссылки на медиа (единая версия API + timeout) ===
 def get_media_url(media_id):
-    url = f"https://graph.facebook.com/v24.0/{media_id}"
+    url = f"https://graph.facebook.com/v21.0/{media_id}"
     headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Accept": "application/json"}
     res = requests.get(url, headers=headers, timeout=30)
     res.raise_for_status()
@@ -406,6 +406,7 @@ def safe_log_data(payload):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
