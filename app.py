@@ -213,63 +213,50 @@ def webhook():
 
 # === Отправка текста в WhatsApp ===
 def send_whatsapp_message(to, message):
-    body = ("" if message is None else str(message)).strip() or "…"  # не пустим пустую строку
-
     url = f"https://graph.facebook.com/v24.0/{WHATSAPP_PHONE_ID}/messages"
     headers = {
         "Authorization": f"Bearer {WHATSAPP_TOKEN}",
-        "Content-Type": "application/json; charset=UTF-8",
-        "Accept": "application/json"
+        "Content-Type": "application/json"
     }
     payload = {
         "messaging_product": "whatsapp",
         "to": to,
         "type": "text",
-        "text": {"body": body[:4000], "preview_url": False}
+        "text": {"body": message[:4000]}  # безопасно обрежем
     }
-    try:
-        r = requests.post(url, headers=headers, json=payload, timeout=30)
-        print("📤 Ответ отправлен:", r.status_code, r.text[:500])
-        r.raise_for_status()
-    except Exception as e:
-        print("❌ Send message error:", e)
-
-
+    response = requests.post(url, headers=headers, json=payload)
+    print("📤 Ответ отправлен:", response.status_code, response.text)
 
 # === Голос в текст (Whisper) ===
 def transcribe_audio(media_id):
-    import uuid, os
-    file_path = None
     try:
         audio_url = get_media_url(media_id)
-        resp = requests.get(audio_url, headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"}, timeout=30)
-        resp.raise_for_status()
-        file_path = f"voice_{uuid.uuid4().hex}.ogg"
-        with open(file_path, "wb") as f:
-            f.write(resp.content)
-        with open(file_path, "rb") as audio_file:
+        audio_data = requests.get(audio_url, headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"}).content
+        with open("voice.ogg", "wb") as f:
+            f.write(audio_data)
+        with open("voice.ogg", "rb") as audio_file:
             transcript = client.audio.transcriptions.create(model="whisper-1", file=audio_file)
         return transcript.text
     except Exception:
         return "Кешіріңіз, аудионы тану сәтсіз болды. Нақты сұрақты мәтінмен жазыңызшы?"
-    finally:
-        if file_path and os.path.exists(file_path):
-            try: os.remove(file_path)
-            except: pass
-
 
 # === Описание изображения ===
 def describe_image(media_id):
+    """
+    Скачиваем медиа по приватной ссылке WhatsApp, кодируем в base64
+    и отправляем модели как data URL (модель видит картинку локально).
+    """
     try:
         img_url = get_media_url(media_id)
+
+        # Скачиваем байты с авторизацией
         resp = requests.get(img_url, headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"}, timeout=30)
         resp.raise_for_status()
-        mime = resp.headers.get("Content-Type", "image/jpeg") or "image/jpeg"
-        if not mime.startswith("image/"):
-            mime = "image/jpeg"
+        mime = resp.headers.get("Content-Type", "image/jpeg")
         b64 = base64.b64encode(resp.content).decode("utf-8")
         data_url = f"data:{mime};base64,{b64}"
 
+        # Просим gpt-5 кратко и по делу описать картинку (деловой тон)
         response = client.chat.completions.create(
             model="gpt-5",
             messages=[{
@@ -278,14 +265,13 @@ def describe_image(media_id):
                     {"type": "text", "text": "Опиши изображение кратко и деловым тоном. Если не связано с ИИ/CRM/автоматизацией — вежливо отметь, что это вне темы."},
                     {"type": "image_url", "image_url": {"url": data_url}}
                 ]
-            }],
-            max_completion_tokens=150
+            }]
         )
-        return (response.choices[0].message.content or "").strip()
+        return response.choices[0].message.content.strip()
+
     except Exception as e:
         print("❌ Image describe error:", e)
         return "Сурет жүктелмеді. Сипаттаманы мәтінмен жібере аласыз ба?"
-
 
 
 # === Получение ссылки на медиа ===
@@ -310,7 +296,6 @@ def notify_owner(client_number, client_name):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
-
 
 
 
