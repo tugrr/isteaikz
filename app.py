@@ -224,7 +224,17 @@ def webhook():
             max_completion_tokens=450
         )
 
-        reply = ai_response.choices[0].message.content.strip()
+        reply = (ai_response.choices[0].message.content or "").strip()
+if not reply:
+    # Фолбэк на языке клиента
+    lang = get_preferred_lang(phone_number, user_message)
+    if lang == "kk":
+        reply = "Сізге қалай көмектесе аламын? WhatsApp/Telegram/Instagram боттары немесе CRM интеграциясы қызықты ма?"
+    elif lang == "en":
+        reply = "How can I help? Are you interested in WhatsApp/Telegram/Instagram bots or a CRM integration?"
+    else:
+        reply = "Чем помочь? Интересуют боты WhatsApp/Telegram/Instagram или интеграция с CRM?"
+
 
         # Триггеры эскалации — с антиспамом 15 минут
         hot_flags = ["созвон", "звонок", "call", "сегодня", "asap", "бюджет", "смета", "цена", "стоимость"]
@@ -251,22 +261,35 @@ def should_notify_owner(phone: str) -> bool:
 
 # === Отправка текста в WhatsApp ===
 def send_whatsapp_message(to, message):
+    # Приводим к строке и подчищаем пробелы/непечатаемые
+    body = ("" if message is None else str(message)).strip()
+
+    # WhatsApp требует непустой text.body — подстрахуемся
+    if not body:
+        body = "…"  # минимальный валидный символ, можно заменить на ваш дефолт
+
     url = f"https://graph.facebook.com/v24.0/{WHATSAPP_PHONE_ID}/messages"
     headers = {
         "Authorization": f"Bearer {WHATSAPP_TOKEN}",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json; charset=UTF-8",
+        "Accept": "application/json"
     }
     payload = {
         "messaging_product": "whatsapp",
         "to": to,
         "type": "text",
-        "text": {"body": message[:4000]}  # безопасно обрежем
+        "text": {
+            "body": body[:4000],        # ограничим длину
+            "preview_url": False        # чтобы не пытался превьюшить URL
+        }
     }
     try:
         response = requests.post(url, headers=headers, json=payload, timeout=30)
         print("📤 Ответ отправлен:", response.status_code, truncate(response.text, 500))
+        response.raise_for_status()
     except Exception as e:
         print("❌ Send message error:", e)
+
 
 # === Голос в текст (Whisper) — с уникальным файлом и удалением ===
 def transcribe_audio(media_id):
@@ -373,3 +396,4 @@ def safe_log_data(payload):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
