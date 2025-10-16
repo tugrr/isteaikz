@@ -243,35 +243,46 @@ def webhook():
             {"role": "system", "content": lang_system_instruction(preferred_lang)},
         ] + sessions[phone_number]
 
-        # Вызываем модель с фолбэком
-        try:
-            ai_response = client.chat.completions.create(
-                model="gpt-5",
-                messages=messages,
-                max_completion_tokens=450
-            )
-            reply = (ai_response.choices[0].message.content or "").strip()
-        except Exception as e:
-            print("❌ AI response error:", e)
-            # Фолбэк на язык клиента
-            lang = detect_lang(user_message)
-            if lang == "kk":
-                reply = "Сізге қалай көмектесе аламын? WhatsApp/Telegram/Instagram боттары немесе CRM интеграциясы қызықты ма?"
-            elif lang == "en":
-                reply = "How can I help? Are you interested in WhatsApp/Telegram/Instagram bots or a CRM integration?"
-            else:
-                reply = "Чем помочь? Интересуют боты WhatsApp/Telegram/Instagram или интеграция с CRM?"
+        # Вызываем модель с фолбэком и анти-повтором
+reply = ""
+try:
+    ai_response = client.chat.completions.create(
+        model="gpt-5",
+        messages=messages,
+        max_completion_tokens=450
+    )
+    reply = (ai_response.choices[0].message.content or "").strip()
+except Exception as e:
+    print("❌ AI response error:", e)
+    reply = ""
 
-        # Пустой ответ — ещё один фолбэк
-        if not reply:
-            lang = detect_lang(user_message)
-            if lang == "kk":
-                reply = "Сізге қалай көмектесе аламын? WhatsApp/Telegram/Instagram боттары немесе CRM интеграциясы қызықты ма?"
-            elif lang == "en":
-                reply = "How can I help? Are you interested in WhatsApp/Telegram/Instagram bots or a CRM integration?"
-            else:
-                reply = "Чем помочь? Интересуют боты WhatsApp/Telegram/Instagram или интеграция с CRM?"
+# Если модель вернула пусто/очень коротко — одна попытка доформулировать без повтора
+if len(_normalize(reply)) < 8 or is_repeat(phone_number, reply):
+    lang = preferred_lang  # уже определён выше через get_preferred_lang(...)
+    regen_messages = messages + [
+        {"role": "system", "content": fallback_prompt(lang)}
+    ]
+    try:
+        ai_response2 = client.chat.completions.create(
+            model="gpt-5",
+            messages=regen_messages,
+            max_completion_tokens=300
+        )
+        alt = (ai_response2.choices[0].message.content or "").strip()
+        if alt and not is_repeat(phone_number, alt):
+            reply = alt
+    except Exception as e:
+        print("❌ AI regen error:", e)
 
+# Если всё ещё пусто/повтор — поставим разнообразный фолбэк
+if len(_normalize(reply)) < 8 or is_repeat(phone_number, reply):
+    reply = fallback_text(preferred_lang)
+
+# Перед отправкой — не допускаем дословного повтора подряд
+if is_repeat(phone_number, reply):
+    reply = reply + " 🙂"
+
+    
         # Триггеры эскалации — с антиспамом 15 минут
         hot_flags = ["созвон", "звонок", "call", "сегодня", "asap", "бюджет", "смета", "цена", "стоимость"]
         if any(flag.lower() in (user_message.lower() + " " + reply.lower()) for flag in hot_flags):
@@ -430,9 +441,40 @@ def safe_log_data(payload):
     except Exception:
         print("📩 Incoming: (log parse error)")
 
+# ====== Хелперы для анти-повтора и фолбэков ======
+def _normalize(s: str) -> str:
+    return " ".join((s or "").strip().lower().split())
+
+def is_repeat(phone: str, candidate: str) -> bool:
+    """Проверяем, совпадает ли кандидат с последним ответом ассистента"""
+    hist = sessions.get(phone, [])
+    for msg in reversed(hist):
+        if msg.get("role") == "assistant":
+            return _normalize(msg.get("content")) == _normalize(candidate)
+    return False
+
+def fallback_prompt(lang: str) -> str:
+    if lang == "kk":
+        return ("Қайталама. 1–2 қысқа нақты сұрақ қой: мақсат, канал (WhatsApp/Telegram/Instagram/дауыс), "
+                "CRM (amo/Bitrix/1C/жоқ), іске қосу мерзімі.")
+    if lang == "en":
+        return ("Do not repeat yourself. Ask 1–2 short, concrete questions: goal, channel "
+                "(WhatsApp/Telegram/Instagram/voice), CRM (amo/Bitrix/1C/none), launch timing.")
+    return ("Не повторяйся. Задай 1–2 коротких уточнения: цель, канал "
+            "(WhatsApp/Telegram/Instagram/голос), CRM (amo/Bitrix/1C/нет), срок запуска.")
+
+def fallback_text(lang: str) -> str:
+    if lang == "kk":
+        return "Қалай көмектесе аламын? WhatsApp/Telegram/Instagram боты ма, әлде CRM интеграциясы керек пе?"
+    if lang == "en":
+        return "How can I help? Are you interested in WhatsApp/Telegram/Instagram bots or a CRM integration?"
+    return "Чем помочь? Интересуют боты WhatsApp/Telegram/Instagram или интеграция с CRM?"
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
