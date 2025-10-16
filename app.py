@@ -213,8 +213,8 @@ def webhook():
 
 # === Отправка текста в WhatsApp ===
 def send_whatsapp_message(to, message):
-    def send_whatsapp_message(to, message):
     body = ("" if message is None else str(message)).strip() or "…"  # не пустим пустую строку
+
     url = f"https://graph.facebook.com/v24.0/{WHATSAPP_PHONE_ID}/messages"
     headers = {
         "Authorization": f"Bearer {WHATSAPP_TOKEN}",
@@ -233,6 +233,7 @@ def send_whatsapp_message(to, message):
         r.raise_for_status()
     except Exception as e:
         print("❌ Send message error:", e)
+
 
 
 # === Голос в текст (Whisper) ===
@@ -309,6 +310,7 @@ def notify_owner(client_number, client_name):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
