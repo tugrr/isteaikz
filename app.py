@@ -11,27 +11,108 @@ VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
 WHATSAPP_PHONE_ID = os.getenv("WHATSAPP_PHONE_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OWNER_NUMBER = os.getenv("OWNER_NUMBER", "77089537431")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-sessions = {}
+# ====== Память сессий ======
+sessions = {}              # {phone: [{"role": "...", "content": "..."}]}
 notified_clients = set()
+MAX_TURNS = 16             # обрезаем историю, чтобы не расползалась
+STRICT_MODE = True         # включен off-topic сторож
 
+# ====== База знаний (short) ======
 ISTE_AI_KNOWLEDGE = """
-🧠 *База знаний ISTE AI*
+🏢 ISTE AI — ИИ-решения под ключ для бизнеса в Казахстане
+Фокус: только прикладной ИИ для компаний РК. Языки: KK/RU/EN. Тон: дружелюбный и деловой.
 
-ISTE AI — компания по внедрению искусственного интеллекта для бизнеса.
-Мы создаём чат-ботов, голосовых ассистентов и системы автоматизации.
+Что делаем:
+• 🔹 ИИ-агенты (менеджеры по продажам/поддержке, рекрутеры, чат-боты)
+• 🔹 Интеграции с CRM/учётом (amoCRM, Bitrix24, 1C, Google Sheets, Webhooks)
+• 🔹 Полный цикл «под ключ»: аудит → пилот 1–2 недели → прод → поддержка
 
-📍 Основные направления:
-• 🤖 ИИ-агенты и чат-боты (WhatsApp, Telegram, сайт)
-• ⚙️ Интеграции с CRM (amoCRM, Bitrix24)
-• 📊 Аналитика и автоматизация
-• 🧠 Обучение ИИ на данных компании
+Принципы:
+• Индивидуальный подход под нишу и KPI
+• Данные клиента по NDA, доступы минимально необходимые
+• Измеримость: цели, метрики, отчёты
 
-🌍 Сайт: iste-ai.kz
-📞 WhatsApp: +7 708 953 74 31
+📊 Прайс-лист (ориентировочно):
+• 💬 WhatsApp-бот — создание и настройка: 100 000 ₸, ежемесячная подписка: 10 000 ₸  
+• 📩 Telegram-бот — создание и настройка: 80 000 ₸, ежемесячная подписка: 8 000 ₸  
+• 📷 Instagram-бот — создание и настройка: 100 000 ₸, ежемесячная подписка: 10 000 ₸  
+
+Кому: сервисы, e-commerce, клиники (без диагностики), образование, недвижимость, b2b-услуги — **на территории Казахстана**.
+
+Ценность:
+• −20–40% нагрузки на операторов, 24/7 обработка
+• +15–30% конверсия из обращений в заявки/бронь
+• Быстрые ответы в мессенджерах (<1 с), устойчивость под трафик
+
+Сбор лида (коротко, по очереди):
+Имя / Компания / Город (в РК) / Ниша → Цель автоматизации → Канал (WhatsApp/Telegram/веб/голос) →
+CRM (amo/Bitrix/1C/нет) → Срок запуска → Бюджет (вилка) → Контакт (WhatsApp/телега/email).
+
+Эскалация владельцу: если «готов созвон», есть бюджет/срок «ASAP», большой трафик, VIP.
+Политики: не даём мед/юрид. советов; не делаем проекты за пределами бизнес-кейсов РК; конфиденциальное — только по NDA.
+Контакты: iste-ai.kz | WhatsApp: +7 708 953 74 31.
 """
+
+
+# ====== Системный промпт (строгие правила тематики) ======
+SYSTEM_RULES = """
+Ты — ассистент ISTE AI. Отвечай на языке клиента (KK/RU/EN).
+Строго держись тем:
+— ИИ-решения «под ключ» для бизнеса в Казахстане
+— ИИ-агенты (менеджеры, рекрутеры, боты), интеграции с CRM/учётом
+— Автоматизация, аналитика, процесс внедрения, сроки, ориентиры стоимости, безопасность и работа с данными
+— География: Казахстан (если клиент из другой страны — вежливо сообщи, что сейчас работаем по РК)
+
+Если вопрос вне тематики (личные темы, учебные задания, финрынки, бытовые вопросы, программирование на заказ и т.п.)
+или вне географии (за пределами РК) — вежливо откажись и мягко верни к нашим услугам в РК:
+«Қазір біз Қазақстандағы бизнеске арналған ИИ-шешімдермен айналысамыз. Сізге қандай бағыт қызықты — WhatsApp/Telegram боттары, рекрутинг, CRM интеграциясы ма?»
+
+Всегда собери краткий бриф (Имя/Компания/Город в РК/Ниша/Цель/Канал/CRM/Срок/Бюджет/Контакт) за 1–3 уточнения.
+Пиши коротко, по делу, 1 явный CTA (предложи мини-бриф или созвон).
+Не выдавай мед/юрид советы и конфиденциальные данные. Соблюдай NDA-тон.
+"""
+
+
+# ====== Классификатор тематики (IN/OUT) ======
+def is_in_scope(text: str) -> bool:
+    if not STRICT_MODE:
+        return True
+    try:
+        clf = client.chat.completions.create(
+            model="gpt-5",
+            temperature=0,
+            max_tokens=2,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Return only IN or OUT.\n"
+                        "IN: message is about BUSINESS AI for companies in KAZAKHSTAN — "
+                        "AI agents (sales/support managers, recruiters, chatbots), CRM integrations, "
+                        "automation, analytics, pricing, process, security, NDA, timelines.\n"
+                        "OUT: personal/medical/legal advice, homework, general coding help, "
+                        "consumer questions, topics not about business AI, or clearly outside Kazakhstan scope."
+                    )
+                },
+                {"role": "user", "content": text[:1000]}
+            ]
+        )
+        label = clf.choices[0].message.content.strip().upper()
+        return label == "IN"
+    except Exception:
+        return True
+
+
+# ====== Возврат оффтопа ======
+OFFTOP_REPLY = (
+    "Похоже, вопрос вне наших услуг. Мы занимаемся ИИ для бизнеса: "
+    "чат-боты WhatsApp/Telegram, голосовые ассистенты, интеграции с amoCRM/Bitrix24/1C и автоматизация процессов. "
+    "Подскажите, что хотите автоматизировать — сбор лидов, запись клиентов, напоминания, FAQ или продажи?"
+)
 
 # === Проверка вебхука ===
 @app.route("/webhook", methods=["GET"])
@@ -39,12 +120,10 @@ def verify():
     mode = request.args.get("hub.mode")
     token = request.args.get("hub.verify_token")
     challenge = request.args.get("hub.challenge")
-
     if mode == "subscribe" and token == VERIFY_TOKEN:
         print("✅ Webhook verified!")
         return challenge, 200
     return "Verification failed", 403
-
 
 # === Обработка сообщений ===
 @app.route("/webhook", methods=["POST"])
@@ -54,19 +133,24 @@ def webhook():
 
     try:
         value = data["entry"][0]["changes"][0]["value"]
-        message = value["messages"][0]
+        messages_in = value.get("messages", [])
+        if not messages_in:
+            return "ok", 200
+
+        message = messages_in[0]
         phone_number = message["from"]
         msg_type = message.get("type")
         contact = value.get("contacts", [{}])[0]
         client_name = contact.get("profile", {}).get("name", "Без имени")
 
+        # Инициализация сессии + одноразовая нотификация владельца
         if phone_number not in sessions:
             sessions[phone_number] = []
             if phone_number not in notified_clients:
                 notify_owner(phone_number, client_name)
                 notified_clients.add(phone_number)
 
-        # === Определяем тип входящего сообщения ===
+        # Определяем тип входящего сообщения
         user_message = ""
         if msg_type == "text":
             user_message = message["text"]["body"]
@@ -77,27 +161,47 @@ def webhook():
 
         elif msg_type == "image":  # 🖼 Фото
             image_id = message["image"]["id"]
-            user_message = describe_image(image_id)
+            # Картинки описываем только если это по теме (например, схема/скрин CRM)
+            img_desc = describe_image(image_id)
+            user_message = f"[image]\n{img_desc}"
 
         else:
-            user_message = "Мен, әзірге, бұл форматтағы хабарламаларды қабылдай алмаймын 🙂"
+            user_message = "Мен әзірге бұл форматтағы хабарламаларды қабылдай алмаймын 🙂"
 
+        # Off-topic фильтр
+        if not is_in_scope(user_message):
+            send_whatsapp_message(phone_number, OFFTOP_REPLY)
+            return "ok", 200
+
+        # Обновляем историю и обрезаем до MAX_TURNS*2 сообщений
         sessions[phone_number].append({"role": "user", "content": user_message})
+        if len(sessions[phone_number]) > MAX_TURNS * 2:
+            sessions[phone_number] = sessions[phone_number][-MAX_TURNS * 2:]
 
         # === Ответ от AI ===
         messages = [
-            {"role": "system", "content": "Сен дружелюбный ИИ-ассистент компании ISTE AI. Говори по-казахски, по-русски или по-английски, как клиент."},
-            {"role": "system", "content": ISTE_AI_KNOWLEDGE}
+            {"role": "system", "content": SYSTEM_RULES},
+            {"role": "system", "content": ISTE_AI_KNOWLEDGE},
         ] + sessions[phone_number]
 
         ai_response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=messages,
-            temperature=0.7,
-            max_tokens=400
+            temperature=0.4,     # немного ниже для стабильности и «без прыжков»
+            max_tokens=450
         )
 
         reply = ai_response.choices[0].message.content.strip()
+
+        # Триггеры эскалации (минимальные эвристики)
+        hot_flags = ["созвон", "звонок", "call", "сегодня", "asap", "бюджет", "смета", "цена", "стоимость"]
+        if any(flag.lower() in (user_message.lower() + " " + reply.lower()) for flag in hot_flags):
+            # Короткое резюме владельцу
+            notify_owner(
+                client_number=phone_number,
+                client_name=client_name
+            )
+
         sessions[phone_number].append({"role": "assistant", "content": reply})
         send_whatsapp_message(phone_number, reply)
 
@@ -105,7 +209,6 @@ def webhook():
         print("❌ Ошибка:", e)
 
     return "ok", 200
-
 
 # === Отправка текста в WhatsApp ===
 def send_whatsapp_message(to, message):
@@ -118,53 +221,61 @@ def send_whatsapp_message(to, message):
         "messaging_product": "whatsapp",
         "to": to,
         "type": "text",
-        "text": {"body": message}
+        "text": {"body": message[:4000]}  # безопасно обрежем
     }
     response = requests.post(url, headers=headers, json=payload)
     print("📤 Ответ отправлен:", response.status_code, response.text)
 
-
 # === Голос в текст (Whisper) ===
 def transcribe_audio(media_id):
-    audio_url = get_media_url(media_id)
-    audio_data = requests.get(audio_url, headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"}).content
-    with open("voice.ogg", "wb") as f:
-        f.write(audio_data)
-    audio_file = open("voice.ogg", "rb")
-    transcript = client.audio.transcriptions.create(model="whisper-1", file=audio_file)
-    return transcript.text
-
+    try:
+        audio_url = get_media_url(media_id)
+        audio_data = requests.get(audio_url, headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"}).content
+        with open("voice.ogg", "wb") as f:
+            f.write(audio_data)
+        with open("voice.ogg", "rb") as audio_file:
+            transcript = client.audio.transcriptions.create(model="whisper-1", file=audio_file)
+        return transcript.text
+    except Exception:
+        return "Кешіріңіз, аудионы тану сәтсіз болды. Нақты сұрақты мәтінмен жазыңызшы?"
 
 # === Описание изображения ===
 def describe_image(media_id):
-    img_url = get_media_url(media_id)
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{
-            "role": "user",
-            "content": [
-                {"type": "text", "text": "Опиши это изображение кратко и дружелюбно."},
-                {"type": "image_url", "image_url": {"url": img_url}}
-            ]
-        }]
-    )
-    return response.choices[0].message.content.strip()
-
+    try:
+        img_url = get_media_url(media_id)
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Опиши изображение кратко, деловым тоном. Если не связано с ИИ/CRM/автоматизацией — вежливо отметь, что это вне темы."},
+                    {"type": "image_url", "image_url": {"url": img_url}}
+                ]
+            }]
+        )
+        return response.choices[0].message.content.strip()
+    except Exception:
+        return "Сурет жүктелмеді. Сипаттаманы мәтінмен жібере аласыз ба?"
 
 # === Получение ссылки на медиа ===
 def get_media_url(media_id):
     url = f"https://graph.facebook.com/v21.0/{media_id}"
     headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}"}
     res = requests.get(url, headers=headers)
+    res.raise_for_status()
     return res.json()["url"]
 
-
-# === Уведомление владельца о новом клиенте ===
+# === Уведомление владельца о новом клиенте/эскалации ===
 def notify_owner(client_number, client_name):
-    owner_number = "77089537431"
-    text = f"📢 *Новый клиент!* \n\n👤 Имя: {client_name}\n📱 Номер: +{client_number}\n💬 Написал впервые в WhatsApp ISTE AI"
-    send_whatsapp_message(owner_number, text)
-
+    text = (
+        "📢 *Новый/горячий клиент*\n\n"
+        f"👤 Имя: {client_name}\n"
+        f"📱 Номер: +{client_number}\n"
+        "💬 Написал(а) в WhatsApp ISTE AI\n"
+        "➡️ Проверь диалог и, если горячий запрос, свяжись."
+    )
+    send_whatsapp_message(OWNER_NUMBER, text)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
