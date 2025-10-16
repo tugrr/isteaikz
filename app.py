@@ -213,19 +213,31 @@ def webhook():
 
 # === Отправка текста в WhatsApp ===
 def send_whatsapp_message(to, message):
+    # WhatsApp требует НЕпустой text.body
+    body = ("" if message is None else str(message)).strip() or "…"
+
     url = f"https://graph.facebook.com/v24.0/{WHATSAPP_PHONE_ID}/messages"
     headers = {
         "Authorization": f"Bearer {WHATSAPP_TOKEN}",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json; charset=UTF-8",
+        "Accept": "application/json"
     }
     payload = {
         "messaging_product": "whatsapp",
         "to": to,
         "type": "text",
-        "text": {"body": message[:4000]}  # безопасно обрежем
+        "text": {
+            "body": body[:4000],   # ограничим длину
+            "preview_url": False   # не пытаться делать превью ссылок
+        }
     }
-    response = requests.post(url, headers=headers, json=payload)
-    print("📤 Ответ отправлен:", response.status_code, response.text)
+    try:
+        r = requests.post(url, headers=headers, json=payload, timeout=30)
+        print("📤 Ответ отправлен:", r.status_code, r.text[:500])
+        r.raise_for_status()
+    except Exception as e:
+        print("❌ Send message error:", e)
+
 
 # === Голос в текст (Whisper) ===
 def transcribe_audio(media_id):
@@ -296,6 +308,7 @@ def notify_owner(client_number, client_name):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
