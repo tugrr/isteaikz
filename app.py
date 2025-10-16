@@ -212,22 +212,24 @@ def webhook():
         if len(sessions[phone_number]) > MAX_TURNS * 2:
             sessions[phone_number] = sessions[phone_number][-MAX_TURNS * 2:]
 
-        # === Ответ от AI ===
-        messages = [
-            {"role": "system", "content": SYSTEM_RULES},
-            {"role": "system", "content": ISTE_AI_KNOWLEDGE},
-        ] + sessions[phone_number]
+       # === Ответ от AI ===
+messages = [
+    {"role": "system", "content": SYSTEM_RULES},
+    {"role": "system", "content": ISTE_AI_KNOWLEDGE},
+] + sessions[phone_number]
 
-        ai_response = client.chat.completions.create(
-            model="gpt-5",
-            messages=messages,
-            max_completion_tokens=450
-        )
+try:
+    ai_response = client.chat.completions.create(
+        model="gpt-5",
+        messages=messages,
+        max_completion_tokens=450
+    )
+    reply = (ai_response.choices[0].message.content or "").strip()
 
-        reply = (ai_response.choices[0].message.content or "").strip()
-if not reply:
-    # Фолбэк на языке клиента
-    lang = get_preferred_lang(phone_number, user_message)
+except Exception as e:
+    print("❌ AI response error:", e)
+    # Фолбэк на языке клиента, если модель упала
+    lang = detect_lang(user_message)
     if lang == "kk":
         reply = "Сізге қалай көмектесе аламын? WhatsApp/Telegram/Instagram боттары немесе CRM интеграциясы қызықты ма?"
     elif lang == "en":
@@ -235,15 +237,25 @@ if not reply:
     else:
         reply = "Чем помочь? Интересуют боты WhatsApp/Telegram/Instagram или интеграция с CRM?"
 
+# Если модель вернулась без текста — подстрахуемся
+if not reply:
+    lang = detect_lang(user_message)
+    if lang == "kk":
+        reply = "Сізге қалай көмектесе аламын? WhatsApp/Telegram/Instagram боттары немесе CRM интеграциясы қызықты ма?"
+    elif lang == "en":
+        reply = "How can I help? Are you interested in WhatsApp/Telegram/Instagram bots or a CRM integration?"
+    else:
+        reply = "Чем помочь? Интересуют боты WhatsApp/Telegram/Instagram или интеграция с CRM?"
 
-        # Триггеры эскалации — с антиспамом 15 минут
-        hot_flags = ["созвон", "звонок", "call", "сегодня", "asap", "бюджет", "смета", "цена", "стоимость"]
-        if any(flag.lower() in (user_message.lower() + " " + reply.lower()) for flag in hot_flags):
-            if should_notify_owner(phone_number):
-                notify_owner(client_number=phone_number, client_name=client_name)
+# Триггеры эскалации — с антиспамом 15 минут
+hot_flags = ["созвон", "звонок", "call", "сегодня", "asap", "бюджет", "смета", "цена", "стоимость"]
+if any(flag.lower() in (user_message.lower() + " " + reply.lower()) for flag in hot_flags):
+    if should_notify_owner(phone_number):
+        notify_owner(client_number=phone_number, client_name=client_name)
 
-        sessions[phone_number].append({"role": "assistant", "content": reply})
-        send_whatsapp_message(phone_number, reply)
+sessions[phone_number].append({"role": "assistant", "content": reply})
+send_whatsapp_message(phone_number, reply)
+
 
     except Exception as e:
         print("❌ Ошибка:", e)
@@ -396,4 +408,5 @@ def safe_log_data(payload):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
