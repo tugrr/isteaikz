@@ -88,7 +88,7 @@ def is_in_scope(text: str) -> bool:
         clf = client.chat.completions.create(
             model="gpt-5",
             temperature=0,
-            max_tokens=2,
+            max_completion_tokens=2,
             messages=[
                 {
                     "role": "system",
@@ -191,7 +191,7 @@ def webhook():
             model="gpt-5",
             messages=messages,
             temperature=0.4,     # немного ниже для стабильности и «без прыжков»
-            max_tokens=450
+            max_completion_tokens=450
         )
 
         reply = ai_response.choices[0].message.content.strip()
@@ -299,4 +299,5 @@ def notify_owner(client_number, client_name):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
