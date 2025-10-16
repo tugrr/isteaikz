@@ -120,6 +120,31 @@ def offtop_reply_for(text: str) -> str:
         return OFFTOP_EN
     return OFFTOP_RU
 
+def get_preferred_lang(phone: str, incoming_text: str = "") -> str:
+    """
+    kk/ru/en на основе текущего сообщения клиента; если оно не текст,
+    ищем последнее осмысленное user-сообщение в истории. Дефолт — ru.
+    """
+    if incoming_text and not incoming_text.strip().startswith("[image]"):
+        return detect_lang(incoming_text)
+
+    history = sessions.get(phone, [])
+    for msg in reversed(history):
+        if msg.get("role") == "user":
+            c = (msg.get("content") or "").strip()
+            if c and not c.startswith("[image]"):
+                return detect_lang(c)
+    return "ru"
+
+
+def lang_system_instruction(lang: str) -> str:
+    if lang == "kk":
+        return "Барлық жауаптарыңды қазақ тілінде бер. Қысқа, іскер стиль, нақты CTA."
+    if lang == "en":
+        return "Answer strictly in English. Be concise, businesslike, with a clear CTA."
+    return "Отвечай строго на русском языке. Кратко, деловым тоном, с явным призывом к действию."
+
+
 # ====== Классификатор тематики (IN/OUT) ======
 def is_in_scope(text: str) -> bool:
     if not STRICT_MODE:
@@ -199,6 +224,8 @@ def webhook():
         else:
             user_message = "Мен әзірге бұл форматтағы хабарламаларды қабылдай алмаймын 🙂"
 
+        preferred_lang = get_preferred_lang(phone_number, user_message)
+        
         # Off-topic фильтр
         if not is_in_scope(user_message):
             send_whatsapp_message(phone_number, offtop_reply_for(user_message))
@@ -406,6 +433,7 @@ def safe_log_data(payload):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
