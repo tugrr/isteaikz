@@ -1,6 +1,7 @@
 from flask import Flask, request
 import requests
 import os
+import base64
 from dotenv import load_dotenv
 from openai import OpenAI
 
@@ -69,7 +70,9 @@ SYSTEM_RULES = """
 
 Если вопрос вне тематики (личные темы, учебные задания, финрынки, бытовые вопросы, программирование на заказ и т.п.)
 или вне географии (за пределами РК) — вежливо откажись и мягко верни к нашим услугам в РК:
-«Қазір біз Қазақстандағы бизнеске арналған ИИ-шешімдермен айналысамыз. Сізге қандай бағыт қызықты — WhatsApp/Telegram боттары, рекрутинг, CRM интеграциясы ма?»
+«Похоже, этот вопрос не относится к нашей сфере 🙂 Мы занимаемся ИИ-решениями для бизнеса в Казахстане. Подскажите, что вам интересно — WhatsApp/Telegram/Instagram боты или автоматизация процессов?
+
+Бұл сұрақ біздің қызмет саламызға жатпайтын сияқты 🙂 Біз Қазақстандағы бизнеске арналған ЖИ-шешімдермен айналысамыз. Қай бағыт сізді қызықтырады — WhatsApp/Telegram/Instagram боттары ма, әлде процестерді автоматтандыру ма?»
 
 Всегда собери краткий бриф (Имя/Компания/Город в РК/Ниша/Цель/Канал/CRM/Срок/Бюджет/Контакт) за 1–3 уточнения.
 Пиши коротко, по делу, 1 явный CTA (предложи мини-бриф или созвон).
@@ -185,7 +188,7 @@ def webhook():
         ] + sessions[phone_number]
 
         ai_response = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-5",
             messages=messages,
             temperature=0.4,     # немного ниже для стабильности и «без прыжков»
             max_tokens=450
@@ -212,7 +215,7 @@ def webhook():
 
 # === Отправка текста в WhatsApp ===
 def send_whatsapp_message(to, message):
-    url = f"https://graph.facebook.com/v21.0/{WHATSAPP_PHONE_ID}/messages"
+    url = f"https://graph.facebook.com/v24.0/{WHATSAPP_PHONE_ID}/messages"
     headers = {
         "Authorization": f"Bearer {WHATSAPP_TOKEN}",
         "Content-Type": "application/json"
@@ -241,26 +244,42 @@ def transcribe_audio(media_id):
 
 # === Описание изображения ===
 def describe_image(media_id):
+    """
+    Скачиваем медиа по приватной ссылке WhatsApp, кодируем в base64
+    и отправляем модели как data URL (модель видит картинку локально).
+    """
     try:
         img_url = get_media_url(media_id)
+
+        # Скачиваем байты с авторизацией
+        resp = requests.get(img_url, headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"}, timeout=30)
+        resp.raise_for_status()
+        mime = resp.headers.get("Content-Type", "image/jpeg")
+        b64 = base64.b64encode(resp.content).decode("utf-8")
+        data_url = f"data:{mime};base64,{b64}"
+
+        # Просим gpt-5 кратко и по делу описать картинку (деловой тон)
         response = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-5",
             temperature=0,
             messages=[{
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": "Опиши изображение кратко, деловым тоном. Если не связано с ИИ/CRM/автоматизацией — вежливо отметь, что это вне темы."},
-                    {"type": "image_url", "image_url": {"url": img_url}}
+                    {"type": "text", "text": "Опиши изображение кратко и деловым тоном. Если не связано с ИИ/CRM/автоматизацией — вежливо отметь, что это вне темы."},
+                    {"type": "image_url", "image_url": {"url": data_url}}
                 ]
             }]
         )
         return response.choices[0].message.content.strip()
-    except Exception:
+
+    except Exception as e:
+        print("❌ Image describe error:", e)
         return "Сурет жүктелмеді. Сипаттаманы мәтінмен жібере аласыз ба?"
+
 
 # === Получение ссылки на медиа ===
 def get_media_url(media_id):
-    url = f"https://graph.facebook.com/v21.0/{media_id}"
+    url = f"https://graph.facebook.com/v24.0/{media_id}"
     headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}"}
     res = requests.get(url, headers=headers)
     res.raise_for_status()
@@ -280,3 +299,4 @@ def notify_owner(client_number, client_name):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
