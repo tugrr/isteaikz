@@ -2,8 +2,6 @@ from flask import Flask, request
 import requests
 import os
 import base64
-import uuid
-from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from openai import OpenAI
 
@@ -18,16 +16,13 @@ OWNER_NUMBER = os.getenv("OWNER_NUMBER", "77089537431")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# ====== Память сессий и антиспам эскалаций ======
-sessions = {}                 # {phone: [{"role": "...", "content": "..."}]}
-notified_clients = set()      # одноразовое приветственное уведомление
-last_owner_notify_at = {}     # {phone: datetime} антиспам эскалации
-NOTIFY_COOLDOWN_MIN = 15      # мин. между эскалациями одному номеру
+# ====== Память сессий ======
+sessions = {}              # {phone: [{"role": "...", "content": "..."}]}
+notified_clients = set()
+MAX_TURNS = 16             # обрезаем историю, чтобы не расползалась
+STRICT_MODE = True         # включен off-topic сторож
 
-MAX_TURNS = 16                # обрезаем историю
-STRICT_MODE = True            # оффтоп-сторож
-
-# ====== База знаний ======
+# ====== База знаний (short) ======
 ISTE_AI_KNOWLEDGE = """
 🏢 ISTE AI — ИИ-решения под ключ для бизнеса в Казахстане
 Фокус: только прикладной ИИ для компаний РК. Языки: KK/RU/EN. Тон: дружелюбный и деловой.
@@ -63,6 +58,7 @@ CRM (amo/Bitrix/1C/нет) → Срок запуска → Бюджет (вил�
 Контакты: iste-ai.kz | WhatsApp: +7 708 953 74 31.
 """
 
+
 # ====== Системный промпт (строгие правила тематики) ======
 SYSTEM_RULES = """
 Ты — ассистент ISTE AI. Отвечай на языке клиента (KK/RU/EN).
@@ -83,67 +79,6 @@ SYSTEM_RULES = """
 Не выдавай мед/юрид советы и конфиденциальные данные. Соблюдай NDA-тон.
 """
 
-# ====== Языки OFFTOP ======
-OFFTOP_KK = (
-    "Бұл сұрақ біздің қызметімізге қатысы жоқ сияқты 🙂 "
-    "Біз Қазақстандағы бизнеске арналған ІІ-шешімдер жасаймыз: WhatsApp/Telegram/Instagram боттары, "
-    "CRM интеграциясы және процестерді автоматтандыру. Қай бағыт керек?"
-)
-OFFTOP_RU = (
-    "Похоже, вопрос вне наших услуг 🙂 Мы делаем ИИ-решения для бизнеса в Казахстане: "
-    "боты WhatsApp/Telegram/Instagram, интеграции с CRM и автоматизацию процессов. Что нужно автоматизировать?"
-)
-OFFTOP_EN = (
-    "Looks like this is outside our scope 🙂 We build AI solutions for businesses in Kazakhstan: "
-    "WhatsApp/Telegram/Instagram bots, CRM integrations, and process automation. What would you like to automate?"
-)
-
-# ====== Простая детекция языка KK/RU/EN ======
-def detect_lang(text: str) -> str:
-    if not text:
-        return "ru"
-    # казахские специфичные символы
-    kk_chars = set("әіңғқңөұүһӘІҢҒҚҢӨҰҮҺ")
-    ru_chars = set("ёйцукенгшщзхъфывапролджэячсмитьбюЁЙЦУКЕНГШЩЗХЪФЫВАПРОЛДЖЭЯЧСМИТЬБЮ")
-    tset = set(text)
-    if tset & kk_chars:
-        return "kk"
-    if tset & ru_chars:
-        return "ru"
-    return "en"
-
-def offtop_reply_for(text: str) -> str:
-    lang = detect_lang(text)
-    if lang == "kk":
-        return OFFTOP_KK
-    if lang == "en":
-        return OFFTOP_EN
-    return OFFTOP_RU
-
-def get_preferred_lang(phone: str, incoming_text: str = "") -> str:
-    """
-    kk/ru/en на основе текущего сообщения клиента; если оно не текст,
-    ищем последнее осмысленное user-сообщение в истории. Дефолт — ru.
-    """
-    if incoming_text and not incoming_text.strip().startswith("[image]"):
-        return detect_lang(incoming_text)
-
-    history = sessions.get(phone, [])
-    for msg in reversed(history):
-        if msg.get("role") == "user":
-            c = (msg.get("content") or "").strip()
-            if c and not c.startswith("[image]"):
-                return detect_lang(c)
-    return "ru"
-
-
-def lang_system_instruction(lang: str) -> str:
-    if lang == "kk":
-        return "Барлық жауаптарыңды қазақ тілінде бер. Қысқа, іскер стиль, нақты CTA."
-    if lang == "en":
-        return "Answer strictly in English. Be concise, businesslike, with a clear CTA."
-    return "Отвечай строго на русском языке. Кратко, деловым тоном, с явным призывом к действию."
-
 
 # ====== Классификатор тематики (IN/OUT) ======
 def is_in_scope(text: str) -> bool:
@@ -152,6 +87,7 @@ def is_in_scope(text: str) -> bool:
     try:
         clf = client.chat.completions.create(
             model="gpt-5",
+            max_completion_tokens=2,
             messages=[
                 {
                     "role": "system",
@@ -165,20 +101,37 @@ def is_in_scope(text: str) -> bool:
                     )
                 },
                 {"role": "user", "content": text[:1000]}
-            ],
-            max_completion_tokens=2
+            ]
         )
         label = clf.choices[0].message.content.strip().upper()
         return label == "IN"
     except Exception:
-        # В сомнительных случаях — не блокируем
         return True
+
+
+# ====== Возврат оффтопа ======
+OFFTOP_REPLY = (
+    "Похоже, вопрос вне наших услуг. Мы занимаемся ИИ для бизнеса: "
+    "чат-боты WhatsApp/Telegram, голосовые ассистенты, интеграции с amoCRM/Bitrix24/1C и автоматизация процессов. "
+    "Подскажите, что хотите автоматизировать — сбор лидов, запись клиентов, напоминания, FAQ или продажи?"
+)
+
+# === Проверка вебхука ===
+@app.route("/webhook", methods=["GET"])
+def verify():
+    mode = request.args.get("hub.mode")
+    token = request.args.get("hub.verify_token")
+    challenge = request.args.get("hub.challenge")
+    if mode == "subscribe" and token == VERIFY_TOKEN:
+        print("✅ Webhook verified!")
+        return challenge, 200
+    return "Verification failed", 403
 
 # === Обработка сообщений ===
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.get_json()
-    safe_log_data(data)
+    print("📩 Получены данные:", data)
 
     try:
         value = data["entry"][0]["changes"][0]["value"]
@@ -196,32 +149,33 @@ def webhook():
         if phone_number not in sessions:
             sessions[phone_number] = []
             if phone_number not in notified_clients:
-                notify_owner(phone_number, client_name)  # приветственное
+                notify_owner(phone_number, client_name)
                 notified_clients.add(phone_number)
 
         # Определяем тип входящего сообщения
         user_message = ""
         if msg_type == "text":
             user_message = message["text"]["body"]
-        elif msg_type == "audio":  # 🎤 Голос
+
+        elif msg_type == "audio":  # 🎤 Голосовое сообщение
             audio_id = message["audio"]["id"]
             user_message = transcribe_audio(audio_id)
+
         elif msg_type == "image":  # 🖼 Фото
             image_id = message["image"]["id"]
-            img_desc = describe_image(image_id)  # функция уже с base64 и фолбэком
+            # Картинки описываем только если это по теме (например, схема/скрин CRM)
+            img_desc = describe_image(image_id)
             user_message = f"[image]\n{img_desc}"
+
         else:
             user_message = "Мен әзірге бұл форматтағы хабарламаларды қабылдай алмаймын 🙂"
 
-        # Автоязык по последнему сообщению/истории
-        preferred_lang = get_preferred_lang(phone_number, user_message)
-
         # Off-topic фильтр
         if not is_in_scope(user_message):
-            send_whatsapp_message(phone_number, offtop_reply_for(user_message))
+            send_whatsapp_message(phone_number, OFFTOP_REPLY)
             return "ok", 200
 
-        # Обновляем историю и обрезаем
+        # Обновляем историю и обрезаем до MAX_TURNS*2 сообщений
         sessions[phone_number].append({"role": "user", "content": user_message})
         if len(sessions[phone_number]) > MAX_TURNS * 2:
             sessions[phone_number] = sessions[phone_number][-MAX_TURNS * 2:]
@@ -230,52 +184,24 @@ def webhook():
         messages = [
             {"role": "system", "content": SYSTEM_RULES},
             {"role": "system", "content": ISTE_AI_KNOWLEDGE},
-            {"role": "system", "content": lang_system_instruction(preferred_lang)},
         ] + sessions[phone_number]
 
-        # --- Генерация с фолбэком и анти-повтором ---
-        reply = ""
-        try:
-            ai_response = client.chat.completions.create(
-                model="gpt-5",
-                messages=messages,
-                max_completion_tokens=450
-            )
-            reply = (ai_response.choices[0].message.content or "").strip()
-        except Exception as e:
-            print("❌ AI response error:", e)
-            reply = ""
+        ai_response = client.chat.completions.create(
+            model="gpt-5",
+            messages=messages,   # немного ниже для стабильности и «без прыжков»
+            max_completion_tokens=450
+        )
 
-        # Если пусто/очень коротко или повтор — одна попытка перегенерации с подсказкой
-        if len(_normalize(reply)) < 8 or is_repeat(phone_number, reply):
-            regen_messages = messages + [
-                {"role": "system", "content": fallback_prompt(preferred_lang)}
-            ]
-            try:
-                ai_response2 = client.chat.completions.create(
-                    model="gpt-5",
-                    messages=regen_messages,
-                    max_completion_tokens=300
-                )
-                alt = (ai_response2.choices[0].message.content or "").strip()
-                if alt and not is_repeat(phone_number, alt):
-                    reply = alt
-            except Exception as e:
-                print("❌ AI regen error:", e)
+        reply = ai_response.choices[0].message.content.strip()
 
-        # Если всё ещё пусто/повтор — финальный фолбэк
-        if len(_normalize(reply)) < 8 or is_repeat(phone_number, reply):
-            reply = fallback_text(preferred_lang)
-
-        # Перед отправкой — не допускаем дословного повтора подряд
-        if is_repeat(phone_number, reply):
-            reply = reply + " 🙂"
-
-        # Триггеры эскалации — с антиспамом 15 минут
+        # Триггеры эскалации (минимальные эвристики)
         hot_flags = ["созвон", "звонок", "call", "сегодня", "asap", "бюджет", "смета", "цена", "стоимость"]
         if any(flag.lower() in (user_message.lower() + " " + reply.lower()) for flag in hot_flags):
-            if should_notify_owner(phone_number):
-                notify_owner(client_number=phone_number, client_name=client_name)
+            # Короткое резюме владельцу
+            notify_owner(
+                client_number=phone_number,
+                client_name=client_name
+            )
 
         sessions[phone_number].append({"role": "assistant", "content": reply})
         send_whatsapp_message(phone_number, reply)
@@ -285,25 +211,11 @@ def webhook():
 
     return "ok", 200
 
-# ====== Антиспам эскалации ======
-def should_notify_owner(phone: str) -> bool:
-    now = datetime.utcnow()
-    last = last_owner_notify_at.get(phone)
-    if last is None or now - last >= timedelta(minutes=NOTIFY_COOLDOWN_MIN):
-        last_owner_notify_at[phone] = now
-        return True
-    return False
-
 # === Отправка текста в WhatsApp ===
 def send_whatsapp_message(to, message):
-    # Приводим к строке и подчищаем пробелы/непечатаемые
-    body = ("" if message is None else str(message)).strip()
-
-    # WhatsApp требует непустой text.body — подстрахуемся
-    if not body:
-        body = "…"  # минимальный валидный символ, можно заменить на ваш дефолт
-
-    url = f"https://graph.facebook.com/v21.0/{WHATSAPP_PHONE_ID}/messages"
+    def send_whatsapp_message(to, message):
+    body = ("" if message is None else str(message)).strip() or "…"  # не пустим пустую строку
+    url = f"https://graph.facebook.com/v24.0/{WHATSAPP_PHONE_ID}/messages"
     headers = {
         "Authorization": f"Bearer {WHATSAPP_TOKEN}",
         "Content-Type": "application/json; charset=UTF-8",
@@ -313,52 +225,47 @@ def send_whatsapp_message(to, message):
         "messaging_product": "whatsapp",
         "to": to,
         "type": "text",
-        "text": {
-            "body": body[:4000],        # ограничим длину
-            "preview_url": False        # чтобы не пытался превьюшить URL
-        }
+        "text": {"body": body[:4000], "preview_url": False}
     }
     try:
-        response = requests.post(url, headers=headers, json=payload, timeout=30)
-        print("📤 Ответ отправлен:", response.status_code, truncate(response.text, 500))
-        response.raise_for_status()
+        r = requests.post(url, headers=headers, json=payload, timeout=30)
+        print("📤 Ответ отправлен:", r.status_code, r.text[:500])
+        r.raise_for_status()
     except Exception as e:
         print("❌ Send message error:", e)
 
 
-# === Голос в текст (Whisper) — с уникальным файлом и удалением ===
+# === Голос в текст (Whisper) ===
 def transcribe_audio(media_id):
+    import uuid, os
     file_path = None
     try:
         audio_url = get_media_url(media_id)
         resp = requests.get(audio_url, headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"}, timeout=30)
         resp.raise_for_status()
-
         file_path = f"voice_{uuid.uuid4().hex}.ogg"
         with open(file_path, "wb") as f:
             f.write(resp.content)
-
         with open(file_path, "rb") as audio_file:
             transcript = client.audio.transcriptions.create(model="whisper-1", file=audio_file)
         return transcript.text
-    except Exception as e:
-        print("❌ Audio transcribe error:", e)
+    except Exception:
         return "Кешіріңіз, аудионы тану сәтсіз болды. Нақты сұрақты мәтінмен жазыңызшы?"
     finally:
         if file_path and os.path.exists(file_path):
-            try:
-                os.remove(file_path)
-            except Exception:
-                pass
+            try: os.remove(file_path)
+            except: pass
 
-# === Описание изображения (base64 data URL) ===
+
+# === Описание изображения ===
 def describe_image(media_id):
     try:
         img_url = get_media_url(media_id)
         resp = requests.get(img_url, headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"}, timeout=30)
         resp.raise_for_status()
-
-        mime = resp.headers.get("Content-Type", "image/jpeg")
+        mime = resp.headers.get("Content-Type", "image/jpeg") or "image/jpeg"
+        if not mime.startswith("image/"):
+            mime = "image/jpeg"
         b64 = base64.b64encode(resp.content).decode("utf-8")
         data_url = f"data:{mime};base64,{b64}"
 
@@ -367,104 +274,41 @@ def describe_image(media_id):
             messages=[{
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": "Опиши изображение кратко и по делу. Если вне нашей тематики (ИИ/CRM/автоматизация) — отметь это вежливо."},
+                    {"type": "text", "text": "Опиши изображение кратко и деловым тоном. Если не связано с ИИ/CRM/автоматизацией — вежливо отметь, что это вне темы."},
                     {"type": "image_url", "image_url": {"url": data_url}}
                 ]
             }],
             max_completion_tokens=150
         )
-        return response.choices[0].message.content.strip()
+        return (response.choices[0].message.content or "").strip()
     except Exception as e:
         print("❌ Image describe error:", e)
         return "Сурет жүктелмеді. Сипаттаманы мәтінмен жібере аласыз ба?"
 
-# === Получение ссылки на медиа (единая версия API + timeout) ===
-def get_media_url(media_id):
-    url = f"https://graph.facebook.com/v21.0/{media_id}"
-    headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Accept": "application/json"}
-    res = requests.get(url, headers=headers, timeout=30)
-    res.raise_for_status()
-    data = res.json()
-    if "url" not in data:
-        print("⚠️ Нет поля 'url' в ответе:", data)
-        raise ValueError("Не удалось получить ссылку на медиа")
-    return data["url"]
 
-# === Уведомление владельца о новом клиенте/эскалации (антиспам выше) ===
+
+# === Получение ссылки на медиа ===
+def get_media_url(media_id):
+    url = f"https://graph.facebook.com/v24.0/{media_id}"
+    headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}"}
+    res = requests.get(url, headers=headers)
+    res.raise_for_status()
+    return res.json()["url"]
+
+# === Уведомление владельца о новом клиенте/эскалации ===
 def notify_owner(client_number, client_name):
     text = (
         "📢 *Новый/горячий клиент*\n\n"
         f"👤 Имя: {client_name}\n"
-        f"📱 Номер: +{mask_phone(client_number)}\n"
+        f"📱 Номер: +{client_number}\n"
         "💬 Написал(а) в WhatsApp ISTE AI\n"
         "➡️ Проверь диалог и, если горячий запрос, свяжись."
     )
     send_whatsapp_message(OWNER_NUMBER, text)
 
-# ====== Утилиты: маскировка PII и безопасные логи ======
-def mask_phone(phone: str) -> str:
-    # маскируем середину номера
-    if not phone or len(phone) < 6:
-        return phone or ""
-    return phone[:3] + "*" * (len(phone) - 5) + phone[-2:]
-
-def truncate(s: str, n: int = 500) -> str:
-    return s if len(s) <= n else s[:n] + "…"
-
-def safe_log_data(payload):
-    try:
-        # минимальный safe-лог: айди сообщения и замаскированный номер
-        entry = payload.get("entry", [{}])[0]
-        change = entry.get("changes", [{}])[0]
-        value = change.get("value", {})
-        msgs = value.get("messages", [])
-        if msgs:
-            m = msgs[0]
-            frm = m.get("from", "")
-            mid = m.get("id", "")
-            print(f"📩 Incoming: id={mid}, from=+{mask_phone(frm)}, type={m.get('type')}")
-        else:
-            print("📩 Incoming: no messages in payload")
-    except Exception:
-        print("📩 Incoming: (log parse error)")
-
-# ====== Хелперы для анти-повтора и фолбэков ======
-def _normalize(s: str) -> str:
-    return " ".join((s or "").strip().lower().split())
-
-def is_repeat(phone: str, candidate: str) -> bool:
-    """Проверяем, совпадает ли кандидат с последним ответом ассистента"""
-    hist = sessions.get(phone, [])
-    for msg in reversed(hist):
-        if msg.get("role") == "assistant":
-            return _normalize(msg.get("content")) == _normalize(candidate)
-    return False
-
-def fallback_prompt(lang: str) -> str:
-    if lang == "kk":
-        return ("Қайталама. 1–2 қысқа нақты сұрақ қой: мақсат, канал (WhatsApp/Telegram/Instagram/дауыс), "
-                "CRM (amo/Bitrix/1C/жоқ), іске қосу мерзімі.")
-    if lang == "en":
-        return ("Do not repeat yourself. Ask 1–2 short, concrete questions: goal, channel "
-                "(WhatsApp/Telegram/Instagram/voice), CRM (amo/Bitrix/1C/none), launch timing.")
-    return ("Не повторяйся. Задай 1–2 коротких уточнения: цель, канал "
-            "(WhatsApp/Telegram/Instagram/голос), CRM (amo/Bitrix/1C/нет), срок запуска.")
-
-def fallback_text(lang: str) -> str:
-    if lang == "kk":
-        return "Қалай көмектесе аламын? WhatsApp/Telegram/Instagram боты ма, әлде CRM интеграциясы керек пе?"
-    if lang == "en":
-        return "How can I help? Are you interested in WhatsApp/Telegram/Instagram bots or a CRM integration?"
-    return "Чем помочь? Интересуют боты WhatsApp/Telegram/Instagram или интеграция с CRM?"
-
-
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
-
-
-
-
 
 
 
