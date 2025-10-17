@@ -1,41 +1,68 @@
-from flask import Flask, request
+from flask import Flask, request, abort
 import requests
 import os
 import base64
+import tempfile
+import time
+import hmac
+import hashlib
+import re
+import uuid
+from collections import deque
 from dotenv import load_dotenv
 from openai import OpenAI
 
 load_dotenv()
 app = Flask(__name__)
 
+# ====== ENV ======
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
 WHATSAPP_PHONE_ID = os.getenv("WHATSAPP_PHONE_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OWNER_NUMBER = os.getenv("OWNER_NUMBER", "77089537431")
+APP_SECRET = os.getenv("APP_SECRET", "")  # для X-Hub-Signature-256
+
+# Проверка обязательных ENV
+REQUIRED_ENVS = ["VERIFY_TOKEN", "WHATSAPP_TOKEN", "WHATSAPP_PHONE_ID", "OPENAI_API_KEY"]
+missing = [k for k in REQUIRED_ENVS if not os.getenv(k)]
+if missing:
+    raise RuntimeError(f"Missing env vars: {', '.join(missing)}")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# ====== Память сессий ======
-sessions = {}              # {phone: [{"role": "...", "content": "..."}]}
-notified_clients = set()
-LAST_REPLY = {}  # {phone: normalized_last_reply}
+# ====== Константы/настройки ======
+MAX_TURNS = 16              # сохраняем компактную историю
+STRICT_MODE = True          # оффтоп-сторож включён
+MAX_MEDIA_MB = 25           # лимит на размер медиа
+SEEN_MSGS = deque(maxlen=5000)  # анти-дедуп по входящим ID
+ESC_COOLDOWN = {}           # анти-спам для эскалаций
+SCOPE_CACHE = {}            # кэш для IN/OUT классификации: {text_norm: (ts, bool)}
+
+# Модели
+GEN_MODEL = "gpt-5"
+TRANSCRIBE_MODEL = "gpt-4o-transcribe"
+
+# ====== Память сессий (обёртка — можно заменить на Redis позже) ======
+class Store:
+    def __init__(self):
+        self.sessions = {}     # {phone: [{"role": "...", "content": "..."}]}
+        self.notified = set()
+        self.last_reply = {}   # {phone: reply}
+
+STORE = Store()
+
+# ====== UI фразы ======
 FALLBACKS = [
     "Чем помочь? Интересуют боты WhatsApp/Telegram/Instagram или интеграция с CRM?",
     "Подскажите, что автоматизировать: WhatsApp/Telegram/Instagram бот или CRM-интеграция?",
     "Готов помочь. Нужен бот (WhatsApp/Telegram/Instagram) или интеграция с amo/Bitrix/1C?"
 ]
-
-def _norm(s: str) -> str:
-    return " ".join((s or "").strip().lower().split())
-
-def next_fallback(phone: str) -> str:
-    # простой круговой индекс по длине истории
-    idx = (len(sessions.get(phone, [])) // 2) % len(FALLBACKS)
-    return FALLBACKS[idx]
-
-MAX_TURNS = 16             # обрезаем историю, чтобы не расползалась
-STRICT_MODE = True         # включен off-topic сторож
+OFFTOP_REPLY = (
+    "Похоже, вопрос вне наших услуг. Мы занимаемся ИИ для бизнеса: "
+    "чат-боты WhatsApp/Telegram, голосовые ассистенты, интеграции с amoCRM/Bitrix24/1C и автоматизация процессов. "
+    "Подскажите, что хотите автоматизировать — сбор лидов, запись клиентов, напоминания, FAQ или продажи?"
+)
 
 # ====== База знаний (short) ======
 ISTE_AI_KNOWLEDGE = """
@@ -53,9 +80,9 @@ ISTE_AI_KNOWLEDGE = """
 • Измеримость: цели, метрики, отчёты
 
 📊 Прайс-лист (ориентировочно):
-• 💬 WhatsApp-бот — создание и настройка: 100 000 ₸, ежемесячная подписка: 10 000 ₸  
-• 📩 Telegram-бот — создание и настройка: 80 000 ₸, ежемесячная подписка: 8 000 ₸  
-• 📷 Instagram-бот — создание и настройка: 100 000 ₸, ежемесячная подписка: 10 000 ₸  
+• 💬 WhatsApp-бот — создание и настройка: 100 000 ₸, ежемесячная подписка: 10 000 ₸
+• 📩 Telegram-бот — создание и настройка: 80 000 ₸, ежемесячная подписка: 8 000 ₸
+• 📷 Instagram-бот — создание и настройка: 100 000 ₸, ежемесячная подписка: 10 000 ₸
 
 Кому: сервисы, e-commerce, клиники (без диагностики), образование, недвижимость, b2b-услуги — **на территории Казахстана**.
 
@@ -73,8 +100,7 @@ CRM (amo/Bitrix/1C/нет) → Срок запуска → Бюджет (вил�
 Контакты: iste-ai.kz | WhatsApp: +7 708 953 74 31.
 """
 
-
-# ====== Системный промпт (строгие правила тематики) ======
+# ====== Системные правила ======
 SYSTEM_RULES = """
 Ты — ассистент ISTE AI. Отвечай на языке клиента (KK/RU/EN).
 Строго держись тем:
@@ -94,15 +120,81 @@ SYSTEM_RULES = """
 Не выдавай мед/юрид советы и конфиденциальные данные. Соблюдай NDA-тон.
 """
 
+# ====== Вспомогательные функции ======
+def _norm(s: str) -> str:
+    return " ".join((s or "").strip().lower().split())
 
-# ====== Классификатор тематики (IN/OUT) ======
+def next_fallback(phone: str) -> str:
+    idx = (len(STORE.sessions.get(phone, [])) // 2) % len(FALLBACKS)
+    return FALLBACKS[idx]
+
+def trim_history(hist, max_chars=8000):
+    total = 0
+    out = []
+    for m in reversed(hist):
+        total += len((m.get("content") or ""))
+        out.append(m)
+        if total >= max_chars:
+            break
+    return list(reversed(out))
+
+def detect_lang(s: str) -> str:
+    s = s or ""
+    kk = re.search(r"[әіңғүқөһӘІҢҒҮҚӨҺ]", s)
+    ru = re.search(r"[А-Яа-яЁё]", s)
+    if kk and not ru:
+        return "KK"
+    if ru:
+        return "RU"
+    return "EN"
+
+def is_duplicate(msg_id: str) -> bool:
+    if not msg_id:
+        return False
+    if msg_id in SEEN_MSGS:
+        return True
+    SEEN_MSGS.append(msg_id)
+    return False
+
+def verify_signature(raw_body: bytes, signature: str) -> bool:
+    # Meta: X-Hub-Signature-256
+    if not APP_SECRET or not signature:
+        return False
+    mac = hmac.new(APP_SECRET.encode(), msg=raw_body, digestmod=hashlib.sha256)
+    expected = "sha256=" + mac.hexdigest()
+    return hmac.compare_digest(expected, signature)
+
+@app.before_request
+def check_meta_signature():
+    # Подписываем только POST-запросы вебхука; GET-верификацию не трогаем
+    if request.method == "POST" and request.path == "/webhook":
+        sig = request.headers.get("X-Hub-Signature-256")
+        if not verify_signature(request.data, sig):
+            return abort(403)
+
+# ====== Классификатор тематики (IN/OUT) с кэшем ======
 def is_in_scope(text: str) -> bool:
     if not STRICT_MODE:
         return True
+    t = _norm(text)
+    now = time.time()
+    hit = SCOPE_CACHE.get(t)
+    if hit and now - hit[0] < 600:  # 10 минут
+        return hit[1]
+
+    # Быстрые эвристики
+    quick_ok = any(k in t for k in ["бот", "whatsapp", "telegram", "интегра", "crm", "битрикс", "amocrm", "автоматиз", "чат-бот"])
+    quick_out = any(k in t for k in ["домашнее задание", "курсова", "реферат", "медицина", "диагноз", "юридически"])
+    if quick_out and not quick_ok:
+        SCOPE_CACHE[t] = (now, False)
+        return False
+
+    # LLM-проверка только при сомнении
     try:
         clf = client.chat.completions.create(
-            model="gpt-5",
+            model=GEN_MODEL,
             max_completion_tokens=2,
+            timeout=10,
             messages=[
                 {
                     "role": "system",
@@ -115,218 +207,144 @@ def is_in_scope(text: str) -> bool:
                         "consumer questions, topics not about business AI, or clearly outside Kazakhstan scope."
                     )
                 },
-                {"role": "user", "content": text[:1000]}
+                {"role": "user", "content": text[:800]}
             ]
         )
-        label = clf.choices[0].message.content.strip().upper()
-        return label == "IN"
-    except Exception:
-        return True
-
-
-# ====== Возврат оффтопа ======
-OFFTOP_REPLY = (
-    "Похоже, вопрос вне наших услуг. Мы занимаемся ИИ для бизнеса: "
-    "чат-боты WhatsApp/Telegram, голосовые ассистенты, интеграции с amoCRM/Bitrix24/1C и автоматизация процессов. "
-    "Подскажите, что хотите автоматизировать — сбор лидов, запись клиентов, напоминания, FAQ или продажи?"
-)
-
-# === Проверка вебхука ===
-@app.route("/webhook", methods=["GET"])
-def verify():
-    mode = request.args.get("hub.mode")
-    token = request.args.get("hub.verify_token")
-    challenge = request.args.get("hub.challenge")
-    if mode == "subscribe" and token == VERIFY_TOKEN:
-        print("✅ Webhook verified!")
-        return challenge, 200
-    return "Verification failed", 403
-
-# === Обработка сообщений ===
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    data = request.get_json()
-    print("📩 Получены данные:", data)
-
-    try:
-        value = data["entry"][0]["changes"][0]["value"]
-        messages_in = value.get("messages", [])
-        if not messages_in:
-            return "ok", 200
-
-        message = messages_in[0]
-        phone_number = message["from"]
-        msg_type = message.get("type")
-        contact = value.get("contacts", [{}])[0]
-        client_name = contact.get("profile", {}).get("name", "Без имени")
-
-        # Инициализация сессии + одноразовая нотификация владельца
-        if phone_number not in sessions:
-            sessions[phone_number] = []
-            if phone_number not in notified_clients and OWNER_NUMBER and OWNER_NUMBER != phone_number:
-                notify_owner(phone_number, client_name)
-                notified_clients.add(phone_number)
-
-        # Определяем тип входящего сообщения
-        user_message = ""
-        if msg_type == "text":
-            user_message = message.get("text", {}).get("body", "").strip()
-        elif msg_type == "audio":  # 🎤 Голос
-            audio_id = message["audio"]["id"]
-            user_message = transcribe_audio(audio_id)
-        elif msg_type == "image":  # 🖼 Фото
-            image_id = message["image"]["id"]
-            img_desc = describe_image(image_id)
-            user_message = f"[image]\n{img_desc}"
-        else:
-            user_message = "Мен әзірге бұл форматтағы хабарламаларды қабылдай алмаймын 🙂"
-
-        # Off-topic фильтр
-        if not is_in_scope(user_message):
-            send_whatsapp_message(phone_number, OFFTOP_REPLY)
-            return "ok", 200
-
-        # Обновляем историю
-        sessions[phone_number].append({"role": "user", "content": user_message})
-        if len(sessions[phone_number]) > MAX_TURNS * 2:
-            sessions[phone_number] = sessions[phone_number][-MAX_TURNS * 2:]
-
-        # === Ответ от AI ===
-        messages = [
-            {"role": "system", "content": SYSTEM_RULES},
-            {"role": "system", "content": ISTE_AI_KNOWLEDGE},
-        ] + sessions[phone_number]
-
-        # --- Генерация ответа с фолбэком ---
-        reply = ""
-        try:
-            ai_response = client.chat.completions.create(
-                model="gpt-4o",
-                messages=messages,
-                max_completion_tokens=450
-            )
-            if not ai_response or not getattr(ai_response, "choices", None):
-                reply = ""
-            else:
-                msg_obj = ai_response.choices[0].message
-                reply = (getattr(msg_obj, "content", "") or "").strip()
-        except Exception as e:
-            print("❌ AI response error:", e)
-            reply = ""
-
-        # Если ответ пустой — подставляем фолбэк
-        if not reply:
-            reply = next_fallback(phone_number)
-
-        # Если совпал с прошлым — подставляем другой фолбэк
-        if _norm(LAST_REPLY.get(phone_number)) == _norm(reply):
-            reply = next_fallback(phone_number)
-
-        # === Триггеры эскалации ===
-        hot_flags = ["созвон", "звонок", "call", "сегодня", "asap", "бюджет", "смета", "цена", "стоимость"]
-        try:
-            if any(flag.lower() in (user_message.lower() + " " + reply.lower()) for flag in hot_flags):
-                if OWNER_NUMBER and OWNER_NUMBER != phone_number:
-                    notify_owner(client_number=phone_number, client_name=client_name)
-        except Exception as e:
-            print("⚠️ Escalation check error:", e)
-
-        # Отправляем клиенту
-        sessions[phone_number].append({"role": "assistant", "content": reply})
-        send_whatsapp_message(phone_number, reply)
-        LAST_REPLY[phone_number] = reply
-
+        label = (clf.choices[0].message.content or "").strip().upper()
+        ok = (label == "IN")
     except Exception as e:
-        print("❌ Ошибка в webhook:", e)
+        print("⚠️ scope LLM fail:", e)
+        ok = True
 
-    return "ok", 200
+    SCOPE_CACHE[t] = (now, ok)
+    return ok
 
+def ai_chat(messages, max_tokens=450, temperature=0.3):
+    try:
+        resp = client.chat.completions.create(
+            model=GEN_MODEL,
+            messages=messages,
+            max_completion_tokens=max_tokens,
+            temperature=temperature,
+            timeout=30
+        )
+        return (resp.choices[0].message.content or "").strip()
+    except Exception as e:
+        print("❌ AI error:", e)
+        return ""
 
+def maybe_escalate(phone, client_name, text_blob):
+    now = time.time()
+    last = ESC_COOLDOWN.get(phone, 0)
+    if now - last < 300:  # 5 минут кулдаун
+        return
+    hot_flags = ["созвон", "звонок", "call", "сегодня", "asap", "бюджет", "смета", "цена", "стоимость"]
+    if any(f in (text_blob or "").lower() for f in hot_flags):
+        if OWNER_NUMBER and OWNER_NUMBER != phone:
+            notify_owner(client_number=phone, client_name=client_name)
+            ESC_COOLDOWN[phone] = now
 
-# === Отправка текста в WhatsApp ===
-def send_whatsapp_message(to, message):
-    # WhatsApp требует НЕпустой text.body
+# ====== WA helpers ======
+def send_whatsapp_message(to, message, retries=2):
     body = ("" if message is None else str(message)).strip() or "…"
-
     url = f"https://graph.facebook.com/v24.0/{WHATSAPP_PHONE_ID}/messages"
     headers = {
         "Authorization": f"Bearer {WHATSAPP_TOKEN}",
         "Content-Type": "application/json; charset=UTF-8",
-        "Accept": "application/json"
+        "Accept": "application/json",
+        "X-Idempotency-Key": str(uuid.uuid4())
     }
     payload = {
         "messaging_product": "whatsapp",
         "to": to,
         "type": "text",
         "text": {
-            "body": body[:4000],   # ограничим длину
-            "preview_url": False   # не пытаться делать превью ссылок
+            "body": body[:4000],
+            "preview_url": False
         }
     }
-    try:
-        r = requests.post(url, headers=headers, json=payload, timeout=30)
-        print("📤 Ответ отправлен:", r.status_code, r.text[:500])
-        r.raise_for_status()
-    except Exception as e:
-        print("❌ Send message error:", e)
+    for i in range(retries + 1):
+        try:
+            r = requests.post(url, headers=headers, json=payload, timeout=30)
+            print("📤 WA send:", r.status_code, r.text[:300])
+            r.raise_for_status()
+            return True
+        except Exception as e:
+            print(f"❌ Send attempt {i+1}:", e)
+            time.sleep(1.2 * (i + 1))
+    return False
 
+def get_media_url(media_id):
+    url = f"https://graph.facebook.com/v24.0/{media_id}"
+    headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}"}
+    res = requests.get(url, headers=headers, timeout=30)
+    res.raise_for_status()
+    return res.json()["url"]
 
-# === Голос в текст (Whisper) ===
 def transcribe_audio(media_id):
     try:
         audio_url = get_media_url(media_id)
-        audio_data = requests.get(audio_url, headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"}).content
-        with open("voice.ogg", "wb") as f:
-            f.write(audio_data)
-        with open("voice.ogg", "rb") as audio_file:
-            transcript = client.audio.transcriptions.create(model="whisper-1", file=audio_file)
-        return transcript.text
-    except Exception:
-        return "Кешіріңіз, аудионы тану сәтсіз болды. Нақты сұрақты мәтінмен жазыңызшы?"
+        r = requests.get(audio_url, headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"}, timeout=30)
+        r.raise_for_status()
+        if len(r.content) > MAX_MEDIA_MB * 1024 * 1024:
+            return "Аудио слишком большое. Пришлите короче 25 МБ."
+        with tempfile.NamedTemporaryFile(suffix=".ogg", delete=True) as f:
+            f.write(r.content)
+            f.flush()
+            with open(f.name, "rb") as audio_file:
+                tr = client.audio.transcriptions.create(model=TRANSCRIBE_MODEL, file=audio_file)
+        return tr.text
+    except Exception as e:
+        print("❌ transcribe:", e)
+        return "Кешіріңіз, аудионы тану болмады. Сұрағыңызды мәтінмен жіберіңізші?"
 
-# === Описание изображения ===
 def describe_image(media_id):
     """
-    Скачиваем медиа по приватной ссылке WhatsApp, кодируем в base64
-    и отправляем модели как data URL (модель видит картинку локально).
+    Скачиваем изображение, кодируем в base64 и просим модель кратко описать,
+    мягко возвращая к бизнес-контексту при оффтопе.
     """
     try:
         img_url = get_media_url(media_id)
-
-        # Скачиваем байты с авторизацией
         resp = requests.get(img_url, headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"}, timeout=30)
         resp.raise_for_status()
         mime = resp.headers.get("Content-Type", "image/jpeg")
+        if not mime.startswith("image/"):
+            return "Получен файл, но это не изображение."
         b64 = base64.b64encode(resp.content).decode("utf-8")
         data_url = f"data:{mime};base64,{b64}"
-
-        # Просим gpt-5 кратко и по делу описать картинку (деловой тон)
         response = client.chat.completions.create(
-            model="gpt-5",
+            model=GEN_MODEL,
+            timeout=30,
             messages=[{
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": "Опиши изображение кратко и деловым тоном. Если не связано с ИИ/CRM/автоматизацией — вежливо отметь, что это вне темы."},
+                    {"type": "text", "text": "Опиши изображение кратко, деловым тоном. Если вне ИИ/CRM — мягко верни к нашим услугам."},
                     {"type": "image_url", "image_url": {"url": data_url}}
                 ]
             }]
         )
-        return response.choices[0].message.content.strip()
-
+        return (response.choices[0].message.content or "").strip()
     except Exception as e:
         print("❌ Image describe error:", e)
-        return "Сурет жүктелмеді. Сипаттаманы мәтінмен жібере аласыз ба?"
+        return "Сурет жүктелмеді. Мәтінмен қысқаша жазыңызшы?"
 
+def extract_user_message(value):
+    msg = value["messages"][0]
+    t = msg.get("type")
+    if t == "text":
+        return (msg.get("text", {}) or {}).get("body", "").strip()
+    if t == "audio":
+        return transcribe_audio(msg["audio"]["id"])
+    if t == "image":
+        return f"[image]\n{describe_image(msg['image']['id'])}"
+    if t == "document":
+        return "Получил документ. Кратко опишите, что нужно автоматизировать по нему?"
+    if t == "video":
+        return "Получил видео. Чем помочь по бизнес-процессам/ботам?"
+    # мягкий дефолт
+    return "Қайырлы күн! Қай бағыт қызықтырады: WhatsApp/Telegram бот немесе CRM интеграция?"
 
-# === Получение ссылки на медиа ===
-def get_media_url(media_id):
-    url = f"https://graph.facebook.com/v24.0/{media_id}"
-    headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}"}
-    res = requests.get(url, headers=headers)
-    res.raise_for_status()
-    return res.json()["url"]
-
-# === Уведомление владельца о новом клиенте/эскалации ===
+# ====== Уведомление владельцу ======
 def notify_owner(client_number, client_name):
     text = (
         "📢 *Новый/горячий клиент*\n\n"
@@ -337,12 +355,96 @@ def notify_owner(client_number, client_name):
     )
     send_whatsapp_message(OWNER_NUMBER, text)
 
+# ====== Проверка вебхука (GET) ======
+@app.route("/webhook", methods=["GET"])
+def verify():
+    mode = request.args.get("hub.mode")
+    token = request.args.get("hub.verify_token")
+    challenge = request.args.get("hub.challenge")
+    if mode == "subscribe" and token == VERIFY_TOKEN:
+        print("✅ Webhook verified!")
+        return challenge, 200
+    return "Verification failed", 403
+
+# ====== Основной обработчик (POST) ======
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    data = request.get_json(silent=True) or {}
+    try:
+        value = data["entry"][0]["changes"][0]["value"]
+    except Exception:
+        return "ok", 200
+
+    # игнорируем статусы/сервисные апдейты
+    messages_in = value.get("messages")
+    if not messages_in:
+        return "ok", 200
+
+    message = messages_in[0]
+    msg_id = message.get("id")
+    if is_duplicate(msg_id):
+        return "ok", 200
+
+    phone_number = message.get("from")
+    msg_type = message.get("type")
+    contact = (value.get("contacts") or [{}])[0]
+    client_name = (contact.get("profile") or {}).get("name", "Без имени")
+
+    print(f"📩 WA: has message, from={phone_number}, type={msg_type}")
+
+    # Инициализация сессии + одноразовая нотификация владельца
+    if phone_number not in STORE.sessions:
+        STORE.sessions[phone_number] = []
+        if phone_number not in STORE.notified and OWNER_NUMBER and OWNER_NUMBER != phone_number:
+            notify_owner(phone_number, client_name)
+            STORE.notified.add(phone_number)
+
+    # Текст пользователя
+    user_message = extract_user_message(value)
+
+    # Off-topic фильтр
+    if not is_in_scope(user_message):
+        send_whatsapp_message(phone_number, OFFTOP_REPLY)
+        return "ok", 200
+
+    # Обновляем историю (обрезаем по символам)
+    STORE.sessions[phone_number].append({"role": "user", "content": user_message})
+    STORE.sessions[phone_number] = trim_history(STORE.sessions[phone_number], max_chars=8000)
+
+    # Язык ответа
+    lang = detect_lang(user_message)
+
+    # Генерация ответа
+    messages = [
+        {"role": "system", "content": SYSTEM_RULES},
+        {"role": "system", "content": ISTE_AI_KNOWLEDGE},
+        {"role": "system", "content": f"Always answer in: {lang}"},
+        *STORE.sessions[phone_number]
+    ]
+    reply = ai_chat(messages, max_tokens=450, temperature=0.3)
+
+    # Фолбэк при пустом ответе
+    if not reply:
+        reply = next_fallback(phone_number)
+
+    # Если совпал с прошлым — подставим другой фолбэк
+    if _norm(STORE.last_reply.get(phone_number)) == _norm(reply):
+        reply = next_fallback(phone_number)
+
+    # Эскалация (с кулдауном)
+    try:
+        maybe_escalate(phone_number, client_name, (user_message or "") + " " + (reply or ""))
+    except Exception as e:
+        print("⚠️ Escalation check error:", e)
+
+    # Отправляем клиенту и сохраняем ответ
+    STORE.sessions[phone_number].append({"role": "assistant", "content": reply})
+    send_whatsapp_message(phone_number, reply)
+    STORE.last_reply[phone_number] = reply
+
+    return "ok", 200
+
+# ====== Запуск ======
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
-
-
-
-
-
-
