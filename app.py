@@ -19,6 +19,21 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 # ====== Память сессий ======
 sessions = {}              # {phone: [{"role": "...", "content": "..."}]}
 notified_clients = set()
+LAST_REPLY = {}  # {phone: normalized_last_reply}
+FALLBACKS = [
+    "Чем помочь? Интересуют боты WhatsApp/Telegram/Instagram или интеграция с CRM?",
+    "Подскажите, что автоматизировать: WhatsApp/Telegram/Instagram бот или CRM-интеграция?",
+    "Готов помочь. Нужен бот (WhatsApp/Telegram/Instagram) или интеграция с amo/Bitrix/1C?"
+]
+
+def _norm(s: str) -> str:
+    return " ".join((s or "").strip().lower().split())
+
+def next_fallback(phone: str) -> str:
+    # простой круговой индекс по длине истории
+    idx = (len(sessions.get(phone, [])) // 2) % len(FALLBACKS)
+    return FALLBACKS[idx]
+
 MAX_TURNS = 16             # обрезаем историю, чтобы не расползалась
 STRICT_MODE = True         # включен off-topic сторож
 
@@ -183,19 +198,31 @@ def webhook():
         ] + sessions[phone_number]
 
         # --- Генерация ответа с фолбэком ---
-        try:
-            ai_response = client.chat.completions.create(
-                model="gpt-5",
-                messages=messages,
-                max_completion_tokens=450
-            )
-            reply = (ai_response.choices[0].message.content or "").strip()
-        except Exception as e:
-            print("❌ AI response error:", e)
-            reply = ""
+       # --- Генерация ответа с валидацией и мягким фолбэком ---
+reply = ""
+try:
+    ai_response = client.chat.completions.create(
+        model="gpt-5",
+        messages=messages,
+        max_completion_tokens=450
+    )
+    if not ai_response or not getattr(ai_response, "choices", None):
+        reply = ""
+    else:
+        msg_obj = ai_response.choices[0].message
+        reply = (getattr(msg_obj, "content", "") or "").strip()
+except Exception as e:
+    print("❌ AI response error:", e)
+    reply = ""
 
-        if not reply:
-            reply = "Чем помочь? Интересуют боты WhatsApp/Telegram/Instagram или интеграция с CRM?"
+# Если ответ пустой — подставляем фолбэк
+if not reply:
+    reply = next_fallback(phone_number)
+
+# Если совпал с прошлым — подставляем другой фолбэк
+if _norm(LAST_REPLY.get(phone_number)) == _norm(reply):
+    reply = next_fallback(phone_number)
+
 
         # Триггеры эскалации (минимальные эвристики)
         hot_flags = ["созвон", "звонок", "call", "сегодня", "asap", "бюджет", "смета", "цена", "стоимость"]
@@ -209,7 +236,9 @@ def webhook():
 
         # Отправляем клиенту
         sessions[phone_number].append({"role": "assistant", "content": reply})
-        send_whatsapp_message(phone_number, reply)
+send_whatsapp_message(phone_number, reply)
+LAST_REPLY[phone_number] = reply  # запоминаем, чтобы не повторялся
+
 
     except Exception as e:
         print("❌ Ошибка в webhook:", e)
