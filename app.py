@@ -186,13 +186,22 @@ def webhook():
             {"role": "system", "content": ISTE_AI_KNOWLEDGE},
         ] + sessions[phone_number]
 
-        ai_response = client.chat.completions.create(
-            model="gpt-5",
-            messages=messages,   # немного ниже для стабильности и «без прыжков»
-            max_completion_tokens=450
-        )
+        # --- Генерация ответа с фолбэком ---
+try:
+    ai_response = client.chat.completions.create(
+        model="gpt-5",
+        messages=messages,
+        max_completion_tokens=450
+    )
+    reply = (ai_response.choices[0].message.content or "").strip()
+except Exception as e:
+    print("❌ AI response error:", e)
+    reply = ""
 
-        reply = ai_response.choices[0].message.content.strip()
+# Если ответ пустой — подставим нормальный дефолт вместо «…»
+if not reply:
+    reply = "Чем помочь? Интересуют боты WhatsApp/Telegram/Instagram или интеграция с CRM?"
+
 
         # Триггеры эскалации (минимальные эвристики)
         hot_flags = ["созвон", "звонок", "call", "сегодня", "asap", "бюджет", "смета", "цена", "стоимость"]
@@ -308,6 +317,7 @@ def notify_owner(client_number, client_name):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
