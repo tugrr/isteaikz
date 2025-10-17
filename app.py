@@ -186,7 +186,7 @@ def webhook():
             send_whatsapp_message(phone_number, OFFTOP_REPLY)
             return "ok", 200
 
-        # Обновляем историю и обрезаем до MAX_TURNS*2 сообщений
+        # Обновляем историю
         sessions[phone_number].append({"role": "user", "content": user_message})
         if len(sessions[phone_number]) > MAX_TURNS * 2:
             sessions[phone_number] = sessions[phone_number][-MAX_TURNS * 2:]
@@ -198,11 +198,10 @@ def webhook():
         ] + sessions[phone_number]
 
         # --- Генерация ответа с фолбэком ---
-        # --- Генерация ответа с валидацией и мягким фолбэком ---
         reply = ""
         try:
             ai_response = client.chat.completions.create(
-                model="gpt-5",
+                model="gpt-4o",
                 messages=messages,
                 max_completion_tokens=450
             )
@@ -223,27 +222,25 @@ def webhook():
         if _norm(LAST_REPLY.get(phone_number)) == _norm(reply):
             reply = next_fallback(phone_number)
 
-
-        # Триггеры эскалации (минимальные эвристики)
+        # === Триггеры эскалации ===
         hot_flags = ["созвон", "звонок", "call", "сегодня", "asap", "бюджет", "смета", "цена", "стоимость"]
         try:
             if any(flag.lower() in (user_message.lower() + " " + reply.lower()) for flag in hot_flags):
                 if OWNER_NUMBER and OWNER_NUMBER != phone_number:
                     notify_owner(client_number=phone_number, client_name=client_name)
         except Exception as e:
-            # даже если тут что-то пойдет не так, ответ клиенту всё равно отправим
             print("⚠️ Escalation check error:", e)
 
         # Отправляем клиенту
         sessions[phone_number].append({"role": "assistant", "content": reply})
-send_whatsapp_message(phone_number, reply)
-LAST_REPLY[phone_number] = reply  # запоминаем, чтобы не повторялся
-
+        send_whatsapp_message(phone_number, reply)
+        LAST_REPLY[phone_number] = reply
 
     except Exception as e:
         print("❌ Ошибка в webhook:", e)
 
     return "ok", 200
+
 
 
 # === Отправка текста в WhatsApp ===
@@ -343,6 +340,7 @@ def notify_owner(client_number, client_name):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
