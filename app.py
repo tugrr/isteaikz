@@ -148,25 +148,21 @@ def webhook():
         # Инициализация сессии + одноразовая нотификация владельца
         if phone_number not in sessions:
             sessions[phone_number] = []
-            if phone_number not in notified_clients:
+            if phone_number not in notified_clients and OWNER_NUMBER and OWNER_NUMBER != phone_number:
                 notify_owner(phone_number, client_name)
                 notified_clients.add(phone_number)
 
         # Определяем тип входящего сообщения
         user_message = ""
         if msg_type == "text":
-            user_message = message["text"]["body"]
-
-        elif msg_type == "audio":  # 🎤 Голосовое сообщение
+            user_message = message.get("text", {}).get("body", "").strip()
+        elif msg_type == "audio":  # 🎤 Голос
             audio_id = message["audio"]["id"]
             user_message = transcribe_audio(audio_id)
-
         elif msg_type == "image":  # 🖼 Фото
             image_id = message["image"]["id"]
-            # Картинки описываем только если это по теме (например, схема/скрин CRM)
             img_desc = describe_image(image_id)
             user_message = f"[image]\n{img_desc}"
-
         else:
             user_message = "Мен әзірге бұл форматтағы хабарламаларды қабылдай алмаймын 🙂"
 
@@ -187,38 +183,39 @@ def webhook():
         ] + sessions[phone_number]
 
         # --- Генерация ответа с фолбэком ---
-try:
-    ai_response = client.chat.completions.create(
-        model="gpt-5",
-        messages=messages,
-        max_completion_tokens=450
-    )
-    reply = (ai_response.choices[0].message.content or "").strip()
-except Exception as e:
-    print("❌ AI response error:", e)
-    reply = ""
+        try:
+            ai_response = client.chat.completions.create(
+                model="gpt-5",
+                messages=messages,
+                max_completion_tokens=450
+            )
+            reply = (ai_response.choices[0].message.content or "").strip()
+        except Exception as e:
+            print("❌ AI response error:", e)
+            reply = ""
 
-# Если ответ пустой — подставим нормальный дефолт вместо «…»
-if not reply:
-    reply = "Чем помочь? Интересуют боты WhatsApp/Telegram/Instagram или интеграция с CRM?"
-
+        if not reply:
+            reply = "Чем помочь? Интересуют боты WhatsApp/Telegram/Instagram или интеграция с CRM?"
 
         # Триггеры эскалации (минимальные эвристики)
         hot_flags = ["созвон", "звонок", "call", "сегодня", "asap", "бюджет", "смета", "цена", "стоимость"]
-        if any(flag.lower() in (user_message.lower() + " " + reply.lower()) for flag in hot_flags):
-            # Короткое резюме владельцу
-            notify_owner(
-                client_number=phone_number,
-                client_name=client_name
-            )
+        try:
+            if any(flag.lower() in (user_message.lower() + " " + reply.lower()) for flag in hot_flags):
+                if OWNER_NUMBER and OWNER_NUMBER != phone_number:
+                    notify_owner(client_number=phone_number, client_name=client_name)
+        except Exception as e:
+            # даже если тут что-то пойдет не так, ответ клиенту всё равно отправим
+            print("⚠️ Escalation check error:", e)
 
+        # Отправляем клиенту
         sessions[phone_number].append({"role": "assistant", "content": reply})
         send_whatsapp_message(phone_number, reply)
 
     except Exception as e:
-        print("❌ Ошибка:", e)
+        print("❌ Ошибка в webhook:", e)
 
     return "ok", 200
+
 
 # === Отправка текста в WhatsApp ===
 def send_whatsapp_message(to, message):
