@@ -198,30 +198,30 @@ def webhook():
         ] + sessions[phone_number]
 
         # --- Генерация ответа с фолбэком ---
-       # --- Генерация ответа с валидацией и мягким фолбэком ---
-reply = ""
-try:
-    ai_response = client.chat.completions.create(
-        model="gpt-5",
-        messages=messages,
-        max_completion_tokens=450
-    )
-    if not ai_response or not getattr(ai_response, "choices", None):
+        # --- Генерация ответа с валидацией и мягким фолбэком ---
         reply = ""
-    else:
-        msg_obj = ai_response.choices[0].message
-        reply = (getattr(msg_obj, "content", "") or "").strip()
-except Exception as e:
-    print("❌ AI response error:", e)
-    reply = ""
+        try:
+            ai_response = client.chat.completions.create(
+                model="gpt-5",
+                messages=messages,
+                max_completion_tokens=450
+            )
+            if not ai_response or not getattr(ai_response, "choices", None):
+                reply = ""
+            else:
+                msg_obj = ai_response.choices[0].message
+                reply = (getattr(msg_obj, "content", "") or "").strip()
+        except Exception as e:
+            print("❌ AI response error:", e)
+            reply = ""
 
-# Если ответ пустой — подставляем фолбэк
-if not reply:
-    reply = next_fallback(phone_number)
+        # Если ответ пустой — подставляем фолбэк
+        if not reply:
+            reply = next_fallback(phone_number)
 
-# Если совпал с прошлым — подставляем другой фолбэк
-if _norm(LAST_REPLY.get(phone_number)) == _norm(reply):
-    reply = next_fallback(phone_number)
+        # Если совпал с прошлым — подставляем другой фолбэк
+        if _norm(LAST_REPLY.get(phone_number)) == _norm(reply):
+            reply = next_fallback(phone_number)
 
 
         # Триггеры эскалации (минимальные эвристики)
@@ -343,6 +343,7 @@ def notify_owner(client_number, client_name):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
