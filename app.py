@@ -15,15 +15,15 @@ from openai import OpenAI
 load_dotenv()
 app = Flask(__name__)
 
-# ====== ENV ======
+
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
 WHATSAPP_PHONE_ID = os.getenv("WHATSAPP_PHONE_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OWNER_NUMBER = os.getenv("OWNER_NUMBER", "77089537431")
-APP_SECRET = os.getenv("APP_SECRET", "")  # для X-Hub-Signature-256
+APP_SECRET = os.getenv("APP_SECRET", "")  
 
-# Проверка обязательных ENV
+
 REQUIRED_ENVS = ["VERIFY_TOKEN", "WHATSAPP_TOKEN", "WHATSAPP_PHONE_ID", "OPENAI_API_KEY"]
 missing = [k for k in REQUIRED_ENVS if not os.getenv(k)]
 if missing:
@@ -31,28 +31,27 @@ if missing:
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# ====== Константы/настройки ======
-MAX_TURNS = 16              # сохраняем компактную историю
-STRICT_MODE = True          # оффтоп-сторож включён
-MAX_MEDIA_MB = 25           # лимит на размер медиа
-SEEN_MSGS = deque(maxlen=5000)  # анти-дедуп по входящим ID
-ESC_COOLDOWN = {}           # анти-спам для эскалаций
-SCOPE_CACHE = {}            # кэш для IN/OUT классификации: {text_norm: (ts, bool)}
+
+MAX_TURNS = 16             
+STRICT_MODE = True      
+MAX_MEDIA_MB = 25          
+SEEN_MSGS = deque(maxlen=5000) 
+ESC_COOLDOWN = {}          
+SCOPE_CACHE = {}           
 
 # Модели
 GEN_MODEL = "gpt-5"
 TRANSCRIBE_MODEL = "gpt-4o-transcribe"
 
-# ====== Память сессий (обёртка — можно заменить на Redis позже) ======
 class Store:
     def __init__(self):
-        self.sessions = {}     # {phone: [{"role": "...", "content": "..."}]}
+        self.sessions = {}     
         self.notified = set()
-        self.last_reply = {}   # {phone: reply}
+        self.last_reply = {}   
 
 STORE = Store()
 
-# ====== UI фразы ======
+
 FALLBACKS = [
     "Чем помочь? Интересуют боты WhatsApp/Telegram/Instagram или интеграция с CRM?",
     "Подскажите, что автоматизировать: WhatsApp/Telegram/Instagram бот или CRM-интеграция?",
@@ -64,7 +63,7 @@ OFFTOP_REPLY = (
     "Подскажите, что хотите автоматизировать — сбор лидов, запись клиентов, напоминания, FAQ или продажи?"
 )
 
-# ====== База знаний (short) ======
+
 ISTE_AI_KNOWLEDGE = """
 🏢 ISTE AI — ИИ-решения под ключ для бизнеса в Казахстане
 Фокус: только прикладной ИИ для компаний РК. Языки: KK/RU/EN. Тон: дружелюбный и деловой.
@@ -100,7 +99,7 @@ CRM (amo/Bitrix/1C/нет) → Срок запуска → Бюджет (вил�
 Контакты: iste-ai.kz | WhatsApp: +7 708 953 74 31.
 """
 
-# ====== Системные правила ======
+
 SYSTEM_RULES = """
 Ты — ассистент ISTE AI. Отвечай на языке клиента (KK/RU/EN).
 Строго держись тем:
@@ -120,7 +119,6 @@ SYSTEM_RULES = """
 Не выдавай мед/юрид советы и конфиденциальные данные. Соблюдай NDA-тон.
 """
 
-# ====== Вспомогательные функции ======
 def _norm(s: str) -> str:
     return " ".join((s or "").strip().lower().split())
 
@@ -157,7 +155,7 @@ def is_duplicate(msg_id: str) -> bool:
     return False
 
 def verify_signature(raw_body: bytes, signature: str) -> bool:
-    # Meta: X-Hub-Signature-256
+
     if not APP_SECRET or not signature:
         return False
     mac = hmac.new(APP_SECRET.encode(), msg=raw_body, digestmod=hashlib.sha256)
@@ -166,30 +164,28 @@ def verify_signature(raw_body: bytes, signature: str) -> bool:
 
 @app.before_request
 def check_meta_signature():
-    # Подписываем только POST-запросы вебхука; GET-верификацию не трогаем
     if request.method == "POST" and request.path == "/webhook":
         sig = request.headers.get("X-Hub-Signature-256")
         if not verify_signature(request.data, sig):
             return abort(403)
 
-# ====== Классификатор тематики (IN/OUT) с кэшем ======
 def is_in_scope(text: str) -> bool:
     if not STRICT_MODE:
         return True
     t = _norm(text)
     now = time.time()
     hit = SCOPE_CACHE.get(t)
-    if hit and now - hit[0] < 600:  # 10 минут
+    if hit and now - hit[0] < 600: 
         return hit[1]
 
-    # Быстрые эвристики
+
     quick_ok = any(k in t for k in ["бот", "whatsapp", "telegram", "интегра", "crm", "битрикс", "amocrm", "автоматиз", "чат-бот"])
     quick_out = any(k in t for k in ["домашнее задание", "курсова", "реферат", "медицина", "диагноз", "юридически"])
     if quick_out and not quick_ok:
         SCOPE_CACHE[t] = (now, False)
         return False
 
-    # LLM-проверка только при сомнении
+
     try:
         clf = client.chat.completions.create(
             model=GEN_MODEL,
@@ -244,7 +240,6 @@ def maybe_escalate(phone, client_name, text_blob):
             notify_owner(client_number=phone, client_name=client_name)
             ESC_COOLDOWN[phone] = now
 
-# ====== WA helpers ======
 def send_whatsapp_message(to, message, retries=2):
     body = ("" if message is None else str(message)).strip() or "…"
     url = f"https://graph.facebook.com/v24.0/{WHATSAPP_PHONE_ID}/messages"
@@ -344,7 +339,7 @@ def extract_user_message(value):
     # мягкий дефолт
     return "Қайырлы күн! Қай бағыт қызықтырады: WhatsApp/Telegram бот немесе CRM интеграция?"
 
-# ====== Уведомление владельцу ======
+
 def notify_owner(client_number, client_name):
     text = (
         "📢 *Новый/горячий клиент*\n\n"
@@ -355,7 +350,7 @@ def notify_owner(client_number, client_name):
     )
     send_whatsapp_message(OWNER_NUMBER, text)
 
-# ====== Проверка вебхука (GET) ======
+
 @app.route("/webhook", methods=["GET"])
 def verify():
     mode = request.args.get("hub.mode")
@@ -366,7 +361,6 @@ def verify():
         return challenge, 200
     return "Verification failed", 403
 
-# ====== Основной обработчик (POST) ======
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.get_json(silent=True) or {}
@@ -375,7 +369,6 @@ def webhook():
     except Exception:
         return "ok", 200
 
-    # игнорируем статусы/сервисные апдейты
     messages_in = value.get("messages")
     if not messages_in:
         return "ok", 200
@@ -392,29 +385,26 @@ def webhook():
 
     print(f"📩 WA: has message, from={phone_number}, type={msg_type}")
 
-    # Инициализация сессии + одноразовая нотификация владельца
     if phone_number not in STORE.sessions:
         STORE.sessions[phone_number] = []
         if phone_number not in STORE.notified and OWNER_NUMBER and OWNER_NUMBER != phone_number:
             notify_owner(phone_number, client_name)
             STORE.notified.add(phone_number)
 
-    # Текст пользователя
     user_message = extract_user_message(value)
 
-    # Off-topic фильтр
     if not is_in_scope(user_message):
         send_whatsapp_message(phone_number, OFFTOP_REPLY)
         return "ok", 200
 
-    # Обновляем историю (обрезаем по символам)
+
     STORE.sessions[phone_number].append({"role": "user", "content": user_message})
     STORE.sessions[phone_number] = trim_history(STORE.sessions[phone_number], max_chars=8000)
 
-    # Язык ответа
+
     lang = detect_lang(user_message)
 
-    # Генерация ответа
+
     messages = [
         {"role": "system", "content": SYSTEM_RULES},
         {"role": "system", "content": ISTE_AI_KNOWLEDGE},
@@ -423,28 +413,25 @@ def webhook():
     ]
     reply = ai_chat(messages, max_tokens=450, temperature=0.3)
 
-    # Фолбэк при пустом ответе
+
     if not reply:
         reply = next_fallback(phone_number)
 
-    # Если совпал с прошлым — подставим другой фолбэк
     if _norm(STORE.last_reply.get(phone_number)) == _norm(reply):
         reply = next_fallback(phone_number)
 
-    # Эскалация (с кулдауном)
     try:
         maybe_escalate(phone_number, client_name, (user_message or "") + " " + (reply or ""))
     except Exception as e:
         print("⚠️ Escalation check error:", e)
 
-    # Отправляем клиенту и сохраняем ответ
     STORE.sessions[phone_number].append({"role": "assistant", "content": reply})
     send_whatsapp_message(phone_number, reply)
     STORE.last_reply[phone_number] = reply
 
     return "ok", 200
 
-# ====== Запуск ======
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
